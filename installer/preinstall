@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+[[ "${3:-/}" == / ]] || { echo 'Only the currently running startup volume is supported.' >&2; exit 1; }
+[[ $(sw_vers -buildVersion) == 25G332 ]] || { echo 'This package requires macOS build 25G332.' >&2; exit 1; }
+python3 -c 'import sys; assert sys.version_info >= (3,9)' || { echo 'Working Python 3.9+ required (Xcode/Command Line Tools).' >&2; exit 1; }

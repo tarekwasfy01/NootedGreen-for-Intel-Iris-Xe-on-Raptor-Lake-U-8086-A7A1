@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+HERE="$(cd "$(dirname "$0")" && pwd)"
+WORK=$(mktemp -d /private/tmp/HP250-GRAPHICS-PKG.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+tar -xzf "$HERE/payload.tar.gz" -C "$WORK"
+python3 "$WORK/stack/stack_runtime.py" install "$WORK/stack"
+DOC='/Library/Application Support/HP250Graphics'
+mkdir -p "$DOC/Licenses"
+ditto --norsrc --noextattr --noacl "$WORK/stack/Licenses" "$DOC/Licenses"
+cp "$WORK/stack/manifest.json" "$WORK/stack/modules.json" "$WORK/stack/stack_runtime.py" "$DOC/"
+echo 'Installation complete. Restart manually through your matching NootedGreen EFI.'

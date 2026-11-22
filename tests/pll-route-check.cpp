@@ -1,0 +1,28 @@
+#include <initializer_list>
+#include "../NootedGreen/HPHDMI/HPHDMIPllRoute.hpp"
+#include <cassert>
+int main(){
+ using namespace HPHDMI;
+ assert(pll0Reuse(true,0x01e07001,0x80000002,0x80000000,0xcc000000,0xcc000000,0x40000000));
+ assert(!pll0Reuse(false,0x01e07001,0x80000002,0x80000000,0xcc000000,0xcc000000,0x40000000));
+ assert(!pll0Reuse(true,0x01e07005,0x80000002,0x80000000,0xcc000000,0xcc000000,0x40000000));
+ assert(!pll0Reuse(true,0x01e07001,0x80000002,0x80000000,0x80000000,0xcc000000,0x40000000));
+ assert(!pll0Reuse(true,0x01e07001,0x80000002,0x80000000,0xcc000000,0x80000000,0x40000000));
+ assert(!pll0Reuse(true,0x01e07001,0x80000002,0,0xcc000000,0xcc000000,0x40000000));
+ assert(!pll0Reuse(true,0xffffffff,0x80000002,0x80000000,0xcc000000,0xcc000000,0x40000000));
+
+ assert(pll0Admission(0x01e07801,0x80000002,0x80,0,0xcc000000,0x40000000));
+ assert(!pll0Admission(0x01e07800,0x80000002,0x80,0,0xcc000000,0x40000000));
+ assert(!pll0Admission(0x01e07801,0x80000002,0x80,0x80000000,0xcc000000,0x40000000));
+ assert(!pll0Admission(0x01e07801,0x80000002,0x80,0,0xcc000000,0));
+ assert(!pll0Admission(0xffffffff,0x80000002,0x80,0,0xcc000000,0x40000000));
+ for(uint32_t bits=0;bits<8192;++bits){
+  uint32_t live=0xa5a50000|bits;
+  for(uint32_t req: {0u,4u,0xffffffffu}) {
+   uint32_t got=pll0RouteWrite(req,live);
+   assert((got&~0x80cu)==(live&~0x80cu));assert(!(got&12));assert((got&0x800)==(req&0x800));
+  }
+ }
+ assert(pll0Register(0x46014)==0x46010);assert(pll0Register(0x16428c)==0x164284);assert(pll0Register(0x164290)==0x164288);
+ assert(pll0Register(0x64000)==0x64000);assert(pll0Register(0x164284)==0x164284);
+}

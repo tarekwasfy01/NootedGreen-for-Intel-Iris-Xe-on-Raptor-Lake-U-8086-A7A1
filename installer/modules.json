@@ -1,0 +1,17 @@
+[
+  {
+    "id": "org.smichaud.HookCase",
+    "uuid": "82F02D18-F736-37AD-96C0-00C8538622A3",
+    "version": "8.0.1"
+  },
+  {
+    "id": "com.xxxxx.driver.AppleIntelTGLGraphicsFramebuffer",
+    "uuid": "B96A8448-9D17-3F78-B76D-15A0B359A9A0",
+    "version": "16.0.0"
+  },
+  {
+    "id": "com.xxxxx.driver.AppleIntelTGLGraphics",
+    "uuid": "BA3AA1C0-FE6B-33B3-9D85-73F848394E3D",
+    "version": "16.0.2"
+  }
+]

@@ -2,6 +2,7 @@
 //  details.
 
 #include "kern_green.hpp"
+#include "kern_hp_a7a1.hpp"
 #include "kern_gen11.hpp"
 #include "kern_genx.hpp"
 #include "kern_model.hpp"
@@ -247,6 +248,12 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 
         this->deviceId = WIOKit::readPCIConfigValue(this->iGPU, WIOKit::kIOPCIConfigDeviceID);
         this->pciRevision = WIOKit::readPCIConfigValue(NGreen::callback->iGPU, WIOKit::kIOPCIConfigRevisionID);
+        uint32_t hpRequested = 0;
+        WIOKit::getOSDataValue(this->iGPU, "ngreen,hp-a7a1", hpRequested);
+        this->hpA7A1Profile = HPA7A1::matches(this->iGPU->configRead16(0), this->deviceId,
+            this->pciRevision, this->iGPU->configRead16(0x2C), this->iGPU->configRead16(0x2E), hpRequested == 1);
+        this->iGPU->setProperty("xe-hp-a7a1-profile", this->hpA7A1Profile);
+        this->iGPU->setProperty("xe-hp-dvmt-patched", false);
 
         // V52: Detect real TGL vs spoofed RPL/ADL by CPU model
         // TGL-U: model 0x8C, TGL-H: model 0x8D
@@ -277,8 +284,14 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 		} else {
 			SYSLOG( "ngreen", "PANIC stolen_size=0 check DVMT in bios");
 		}
-		if (stolen_size<128) stolen_size=128;
+		if (this->hpA7A1Profile) {
+            // Preserve the firmware's actual capacity on this measured HP;
+            // never advertise 128 MiB where the BIOS reserved only 60 MiB.
+            stolen_size = HPA7A1::dvmtBytes(static_cast<uint8_t>(gms)) / HPA7A1::MiB;
+        } else if (stolen_size<128) stolen_size=128;
 		stolen_size *= (1024 * 1024);
+        if (this->hpA7A1Profile)
+            this->iGPU->setProperty("xe-hp-dvmt-bytes", this->stolen_size, 32);
 		SYSLOG("ngreen", "stolen_size 0x%x",stolen_size);
 		
 		if (isLegacyIGPUPropSeedingEnabled()) {

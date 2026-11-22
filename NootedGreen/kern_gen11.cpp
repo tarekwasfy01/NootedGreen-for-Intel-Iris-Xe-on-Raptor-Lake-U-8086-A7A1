@@ -6,11 +6,554 @@ static bool xeFixEnabled();  // xe/xefix, definido junto do FastWriteRegister32
 #include <Headers/kern_api.hpp>
 #include "kern_genx.hpp"
 #include "kern_green.hpp"
+#include "kern_hp_a7a1.hpp"
+#include "HPHDMI/Backend.hpp"
+#include "HPHDMI/HPHDMIPllRoute.hpp"
+#include "HPHDMI/HPHDMIWirePolicy.hpp"
+#include "HPHDMI/HPHDMIModeset.hpp"
+#include "HPHDMI/HPHDMIPort.hpp"
+#include "HPHDMI/HPHDMIGmbus.hpp"
+#include "HPHDMI/HPHDMIIndexedDdc.hpp"
+#include "HPHDMI/HPHDMIScanout.hpp"
+// HP native-HDMI IO supply: DDI A request=bit1, DDI B request=bit3.
+// The historical literal 0x3 requests A only. Preserve all other current requests.
+static uint32_t hpHDMIDDIRequest() {
+    auto *ng = NGreen::callback;
+    if (!ng || !ng->getHPA7A1Profile() || !checkKernelArgument("-ngreenhphdmiio")) return 3;
+    const uint32_t current = ng->readReg32(0x45454);
+    if (current == 0xffffffffu) return 3;
+    return current | 0xau;
+}
+
 #include "IntelDPLinkTraining.hpp"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOCatalogue.h>
 #include <IOKit/IOLib.h>
 #include <kern/thread_call.h>
+#include <kern/thread.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/i2c/IOI2CInterface.h>
+static_assert(sizeof(IOI2CRequest)==0x7c,"Donor I2C request ABI");
+static_assert(__builtin_offsetof(IOI2CRequest,replyBuffer)==0x4c,"Donor reply buffer ABI");
+
+// HP native-HDMI DDC bridge. No synthetic AUX, trained status, or scanout.
+// Exact donor ABI guarded before routing. Keep the original display workloop
+// gate; do not acquire another lock or touch the bus from a background thread.
+static mach_vm_address_t hpDdcOriginal=0,hpGmbusAddress=0,hpWorkLoopAddress=0,hpControllerAddress=0;
+// Nonblocking, per-call scope. Never leave PLL masks armed after hotplug.
+static volatile uintptr_t hpHdmiClockOwner=0;
+static mach_vm_address_t hpEnableClocksOriginal=0;
+static mach_vm_address_t hpDisableClocksOriginal=0;
+static bool hpPll0Trial=false,hpPll0Hooks=false,hpPll0Active=false,hpPll0Fault=false;
+// The HP panel uses the legacy gamma mode. Test the same mode on the
+// external pipe only after the v31 HP-specific HDMI admission succeeded.
+static bool hpLegacyGammaB(unsigned long reg) {
+ return reg==0x4ac80u && hpPll0Active && hpPll0Trial && !hpPll0Fault;
+}
+static bool hpDpTimingReady=false,hpScopeReady=false;
+static bool hpRgb8Required=false,hpRgb8Ready=false;
+static bool hpIndexedDdcEnabled=false;
+static mach_vm_address_t hpValidateTimingOriginal=0;
+static uint32_t hpValidateTiming(void *fb,void *description,unsigned long length) {
+ using Original=uint32_t(*)(void*,void*,unsigned long);
+ if(fb&&description&&length==sizeof(IOFBDisplayModeDescription)&&getMember<uint32_t>(fb,0x1dc)==1u) {
+  auto *d=static_cast<IOFBDisplayModeDescription*>(description);
+  const auto &t=d->timingInfo.detailedInfo.v2;
+  if(!HPHDMI::rgb8Request(t.pixelEncoding,t.bitsPerColorComponent,t.dynamicRange)) {
+   NGreen::callback->publishHPWireRejected();
+   return kIOReturnUnsupported;
+  }
+ }
+ return reinterpret_cast<Original>(hpValidateTimingOriginal)(fb,description,length);
+}
+static void hpScanoutSnapshot() {
+ // Bounded, read-only MMIO. No waits, allocation of surfaces, or writes.
+ // Preserve both pipes for comparison with the existing Linux register dump.
+ uint32_t r[]={1,0x60400,0,0x61400,0,0x64000,0,0x64100,0,
+  0x70008,0,0x71008,0,0x70040,0,0x71040,0,
+  0x70180,0,0x71180,0,0x70188,0,0x71188,0,0x7019c,0,0x7119c,0,
+  0x7027c,0,0x7127c,0,0x7003c,0,0x7103c,0,0x164284,0,0x164288,0,
+  0x46000,0,0x164280,0,0x46144,0,0x61000,0,0x6100c,0,
+  0x45008,0,0x44fe8,0,0x44300,0,0x44304,0};
+ for(unsigned i=1;i+1<sizeof(r)/sizeof(r[0]);i+=2)r[i+1]=NGreen::callback->readReg32(r[i]);
+ auto *data=OSData::withBytes(r,sizeof(r));
+ if(data){NGreen::callback->publishHPScanout(data);data->release();}
+}
+static bool hpPll0Scope() {
+ uintptr_t owner=__sync_fetch_and_add(&hpHdmiClockOwner,0);
+ return hpPll0Active&&owner&&owner==reinterpret_cast<uintptr_t>(current_thread());
+}
+static void hpDisableClocks(void *controller,void *port,void *master) {
+ using Original=void(*)(void*,void*,void*);
+ const uint32_t *desc=port?getMember<const uint32_t*>(port,0x548):nullptr;
+ uintptr_t thread=reinterpret_cast<uintptr_t>(current_thread());
+ bool owns=hpPll0Active&&desc&&desc[0]==1&&desc[2]==2&&desc[3]==0&&master==nullptr&&thread&&
+           __sync_bool_compare_and_swap(&hpHdmiClockOwner,0,thread);
+ // For an active remapped HDMI output, never let a master-port transaction
+ // shut down the panel PLL through this wrapper.
+ if(hpPll0Active&&desc&&desc[0]==1&&!owns){hpPll0Fault=true;return;}
+ reinterpret_cast<Original>(hpDisableClocksOriginal)(controller,port,master);
+ if(owns)__sync_bool_compare_and_swap(&hpHdmiClockOwner,thread,0);
+}
+
+static void hpEnableClocks(void *controller,void *port,void *master,void *params) {
+ using Original=void(*)(void*,void*,void*,void*);
+ auto original=reinterpret_cast<Original>(hpEnableClocksOriginal);
+ const uint32_t *desc=port?getMember<const uint32_t*>(port,0x548):nullptr;
+ bool own=desc&&desc[0]==1&&desc[2]==2&&desc[3]==0&&master==nullptr;
+ uintptr_t thread=reinterpret_cast<uintptr_t>(current_thread());
+ own=own&&thread&&__sync_bool_compare_and_swap(&hpHdmiClockOwner,0,thread);
+ if(hpPll0Active&&desc&&desc[0]==1&&!own){hpPll0Fault=true;return;}
+ original(controller,port,master,params);
+ if(own)__sync_bool_compare_and_swap(&hpHdmiClockOwner,thread,0);
+}
+static void hpPll0Write(unsigned long &reg,uint32_t &value) {
+ if(!hpPll0Scope())return;
+ if(reg==0x164280) {
+  uint32_t live=NGreen::callback->readReg32(0x164280);
+  value=HPHDMI::pll0RouteWrite(value,live);
+ }
+ reg=HPHDMI::pll0Register(reg);
+}
+static bool hpNativeDdcEnabled() {
+ return NGreen::callback && NGreen::callback->getHPA7A1Profile() &&
+        checkKernelArgument("-ngreenhpnativeddc");
+}
+static void hpDdcReport(uint32_t block,uint32_t result,uint32_t nativeResult) {
+ uint32_t report[]={1,block,result,nativeResult};
+ auto *data=OSData::withBytes(report,sizeof(report));
+ if(data){NGreen::callback->publishHPDDCRecord(data);data->release();}
+}
+struct HPDonorDdcTransport {
+ void *controller;
+ IOReturn status=kIOReturnError;
+ uint32_t calls=0,lastOffset=0,lastLength=0,header[2]={};
+ uint32_t indexedResult=0xffffffffu;
+ bool transfer(uint32_t offset,uint8_t *buffer,uint32_t length) {
+  ++calls;lastOffset=offset;lastLength=length;
+  if(hpIndexedDdcEnabled) {
+   struct Io {
+    uint32_t read(uint32_t r){return NGreen::callback->readReg32(r);}
+    void write(uint32_t r,uint32_t v){NGreen::callback->writeReg32(r,v);}
+    void delay(unsigned us){IODelay(us);}
+   } io;
+   auto result=HPHDMI::indexedDdcRead(io,offset,buffer,length);
+   indexedResult=static_cast<uint32_t>(result);
+   status=result==HPHDMI::IndexedResult::Ready?kIOReturnSuccess:kIOReturnIOError;
+   if(offset==0&&length>=8)memcpy(header,buffer,sizeof(header));
+   return result==HPHDMI::IndexedResult::Ready;
+  }
+  IOI2CRequest request={};
+  request.replyTransactionType=kIOI2CSimpleTransactionType;
+  request.replyAddress=0xa0;
+  request.replySubAddress=static_cast<uint8_t>(offset);
+  request.commFlags=kIOI2CUseSubAddressCommFlag;
+  request.sendBytes=1;
+  request.replyBytes=length;
+  request.replyBuffer=reinterpret_cast<vm_address_t>(buffer);
+  request.result=kIOReturnError;
+  using Transfer=IOReturn(*)(void*,uint32_t,uint32_t,IOI2CRequest*);
+  // The donor CPU patch assembles GMBUS0 from the first scalar's low pin bits,
+  // the second scalar's policy bits, and the transfer phase. The exact
+  // getDDCBlock caller passes (busId=2, policy=0), so preserve (2,0).
+  // HP VBT + Linux ADLP mapping select pin 2 for physical DDI B, not legacy 5.
+  status=reinterpret_cast<Transfer>(hpGmbusAddress)(controller,2,0,&request);
+  if(status==kIOReturnSuccess)status=request.result;
+  if(offset==0&&length>=8)memcpy(header,buffer,sizeof(header));
+  return status==kIOReturnSuccess && request.replyBytes==length;
+ }
+};
+static IOReturn hpNativeDdc(void *port,uint32_t block,uint8_t *buffer,bool bypass) {
+ using Original=IOReturn(*)(void*,uint32_t,uint8_t*,bool);
+ auto original=reinterpret_cast<Original>(hpDdcOriginal);
+ if(!hpNativeDdcEnabled()||!hpGmbusAddress||!hpWorkLoopAddress||!hpControllerAddress||!port||!buffer)
+  return original(port,block,buffer,bypass);
+ const uint32_t *info=getMember<const uint32_t*>(port,0x548);
+ if(!info||info[0]!=1)return original(port,block,buffer,bypass); // DDI B only.
+ void *controller=*reinterpret_cast<void**>(hpControllerAddress);
+ auto getLoop=reinterpret_cast<IOWorkLoop*(*)(const void*)>(hpWorkLoopAddress);
+ IOWorkLoop *loop=controller?getLoop(controller):nullptr;
+ if(!loop||!loop->inGate()) {
+  hpDdcReport(block,0x100,0);return original(port,block,buffer,bypass);
+ }
+ const uint32_t power=NGreen::callback->readReg32(0x45454);
+ if(power==0xffffffffu || (power&0xc)!=0xc) {
+  hpDdcReport(block,0x101,power);return kIOReturnNotReady;
+ }
+ HPDonorDdcTransport transport={controller};
+ const auto first=HPHDMI::readNativeEdid(transport,block,buffer);
+ auto result=first;
+ if(first!=HPHDMI::DdcResult::Ready&&first!=HPHDMI::DdcResult::InvalidBlock)
+  result=HPHDMI::recoverNativeEdid(transport,block,buffer);
+ const uint32_t trace[]={1,block,static_cast<uint32_t>(first),static_cast<uint32_t>(result),
+  transport.calls,transport.lastOffset,transport.lastLength,transport.header[0],transport.header[1],
+  NGreen::callback->readReg32(0xc5100),NGreen::callback->readReg32(0xc5104),NGreen::callback->readReg32(0xc5108)};
+ auto *record=OSData::withBytes(trace,sizeof(trace));
+ if(record){NGreen::callback->publishHPDdcRecovery(record);record->release();}
+ if(hpIndexedDdcEnabled)NGreen::callback->publishHPIndexedResult(transport.indexedResult);
+ hpDdcReport(block,static_cast<uint32_t>(result),static_cast<uint32_t>(transport.status));
+ if(result==HPHDMI::DdcResult::Ready) {
+  if(block==1){
+   auto *edid=OSData::withBytes(buffer,128);
+   if(edid){NGreen::callback->publishHPDDCEdid(edid);edid->release();}
+  }
+  return kIOReturnSuccess;
+ }
+ return result==HPHDMI::DdcResult::InvalidBlock?kIOReturnUnsupported:kIOReturnIOError;
+}
+
+static const uint8_t hpGetDDCPrefix[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0xc8,0x0,0x0,0x0,0x48,0xff,0x5,0x8f,0xd0,0x11,0x0,0x41,0x89,0xcf,0x49,0x89};
+static const uint8_t hpGMBusPrefix[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x88,0x0,0x0,0x0,0x48,0xff,0x5,0x6d,0xd8,0xd,0x0,0x49,0x89,0xce,0x41,0x89};
+static const uint8_t hpWorkLoopPrefix[]={0x55,0x48,0x89,0xe5,0x53,0x50,0x48,0xff,0x5,0x5b,0x15,0xf,0x0,0x48,0x8b,0x87,0x0,0xe,0x0,0x0,0x48,0x85,0xc0,0x74,0x7,0x48,0x83,0xc4,0x8,0x5b,0x5d,0xc3};
+static mach_vm_address_t hpGmbusReadOriginal=0;
+static uintptr_t hpGmbusPollReturn=0;
+// The routed read hook is installed only when native DDC is enabled. Keep its
+// hot path independent of profile lookup and boot-argument parsing.
+static bool hpGmbusHookActive=false;
+static uint32_t hpGmbusRead(void *accessor,unsigned long reg) {
+ using Read=uint32_t(*)(void*,unsigned long);
+ auto original=reinterpret_cast<Read>(hpGmbusReadOriginal);
+ unsigned long actual=hpPll0Scope()?HPHDMI::pll0Register(reg):reg;
+ uint32_t value=original(accessor,actual);
+ if(reg==0xc5108 && hpGmbusHookActive && hpGmbusPollReturn &&
+    reinterpret_cast<uintptr_t>(__builtin_return_address(0))==hpGmbusPollReturn) {
+  struct PollIo {
+   Read readFn;void *accessor;
+   uint32_t read(){return readFn(accessor,0xc5108);}
+   void delay(unsigned us){IODelay(us);}
+  } io {original,accessor};
+  value=HPHDMI::waitGmbusReady(io,value);
+ }
+ return value;
+}
+
+// Intel Display WA #22010492432, matching the measured HP Combo PLL.
+// Correct the calculated fraction, retaining Apple's PLL/power ownership.
+static mach_vm_address_t hpPllDivisorsOriginal=0;
+static int hpPllDivisors(void *controller,unsigned int pixelHz,void *path) {
+ using Original=int(*)(void*,unsigned int,void*);
+ const int result=reinterpret_cast<Original>(hpPllDivisorsOriginal)(controller,pixelHz,path);
+ if(result || !path || pixelHz!=148500000u)return result;
+ void *port=getMember<void*>(path,0x3648);
+ const uint32_t *desc=port?getMember<const uint32_t*>(port,0x548):nullptr;
+ if(!desc||desc[0]!=1||desc[2]!=2||desc[3]!=0)return result;
+ auto *ng=NGreen::callback;
+ if(!ng||((ng->readReg32(0x51004)>>29)&7u)!=2u)return result;
+ auto *words=reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(path)+0x218);
+ // Exact 1080p60 result independently reconstructed from donor divider table.
+ // Refuse an unexpected layout/value instead of changing another mode.
+ if(words[0]!=464u||words[1]!=2048u||words[2]!=2u||words[3]!=3u||words[4]!=2u)return result;
+ words[1]=1024u;
+ ng->publishHPFraction(true,true);
+ IOLog("HPHDMI: 148.5MHz Combo PLL fraction 0x800 -> 0x400 (38.4MHz WA)\n");
+ return result;
+}
+
+// HDMI/TMDS has no DP M/N or lane-rate timing contract. The donor calls
+// setupDPTimings unconditionally; preserve SetupTimings/SetupParams for TMDS.
+static mach_vm_address_t hpDpTimingsOriginal=0;
+static int hpDpTimings(void *controller,void *framebuffer,void *path,void *params) {
+ using Original=int(*)(void*,void*,void*,void*);
+ const uint32_t fb=framebuffer?getMember<uint32_t>(framebuffer,0x1dc):0xffffffffu;
+ void *port=path?getMember<void*>(path,0x3648):nullptr;
+ const uint32_t *desc=port?getMember<const uint32_t*>(port,0x548):nullptr;
+ if(fb==1&&desc&&desc[0]==1&&desc[2]==2&&desc[3]==0) {
+  IOLog("HPHDMI: native TMDS skips DP lane/M-N timing setup\n");
+  return kIOReturnSuccess;
+ }
+ return reinterpret_cast<Original>(hpDpTimingsOriginal)(controller,framebuffer,path,params);
+}
+
+// Conservative containment: reject the unqualified external HDMI transition
+// before Apple's hwSetMode can disable shared clocks or the existing panel.
+// HP Xe-LPD external HDMI experiment. Arm the trace for one boot, including
+// late teardown. Bounded logging avoids continuously sampling the render path.
+static volatile uint32_t hpPipeTraceArmed=0, hpPipeTraceCount=0;
+static mach_vm_address_t hpEnablePipeOriginal=0, hpDisableDisplayOriginal=0;
+
+static void hpPipeStage(const char *stage) {
+ auto *ng=NGreen::callback;
+ IOLog("HPPIPE31 stage=%s tick=%llu ctl2=%08x fuse=%08x pipe=%08x trans=%08x plane=%08x htotal=%08x frame=%08x\n",
+       stage,mach_absolute_time(),ng->readReg32(0x45404),ng->readReg32(0x42000),
+       ng->readReg32(0x71008),ng->readReg32(0x61400),ng->readReg32(0x71180),
+       ng->readReg32(0x61000),ng->readReg32(0x71040));
+}
+
+// No MMIO for unrelated writes. Before/after values are direct BAR reads;
+// an attempted write through a cache is distinguishable from a latched value.
+struct HpPipeWrite {
+ uint32_t seq=0, reg=0, wanted=0, before=0;
+ uint64_t start=0;
+ const char *path;
+ HpPipeWrite(const char *source,unsigned long offset,uint32_t value):path(source) {
+  if(!hpPipeTraceArmed)return;
+  switch(offset) {
+   case 0x61000: case 0x6100c: case 0x61400: case 0x71008:
+   case 0x71180: case 0x46144: case 0x45404: break;
+   default:return;
+  }
+  if(hpPipeTraceCount>=512)return;
+  seq=__sync_add_and_fetch(&hpPipeTraceCount,1u);
+  if(seq>512){seq=0;return;}
+  reg=static_cast<uint32_t>(offset);wanted=value;start=mach_absolute_time();
+  before=NGreen::callback->readReg32(reg);
+ }
+ ~HpPipeWrite() {
+  if(seq) {
+   uint32_t after=NGreen::callback->readReg32(reg);
+   auto end=mach_absolute_time();
+   IOLog("HPPIPE31 write=%u path=%s start=%llu end=%llu reg=%08x before=%08x wanted=%08x after=%08x\n",
+         seq,path,start,end,reg,before,wanted,after);
+   if(seq==512)IOLog("HPPIPE31 write trace limit reached\n");
+  }
+ }
+};
+
+static void hpTraceEnablePipe(void *ctrl,void *fb,void *path,const void *timing) {
+ bool external=hpPipeTraceArmed&&fb&&getMember<uint32_t>(fb,0x1dc)==1;
+ if(external)hpPipeStage("enablePipe-enter");
+ reinterpret_cast<void(*)(void*,void*,void*,const void*)>(hpEnablePipeOriginal)(ctrl,fb,path,timing);
+ if(external)hpPipeStage("enablePipe-return");
+}
+
+static void hpTraceDisableDisplay(void *ctrl,void *fb,void *path,uint8_t flags) {
+ bool external=hpPipeTraceArmed&&fb&&getMember<uint32_t>(fb,0x1dc)==1;
+ if(external)hpPipeStage("disableDisplay-enter");
+ reinterpret_cast<void(*)(void*,void*,void*,uint8_t)>(hpDisableDisplayOriginal)(ctrl,fb,path,flags);
+ if(external)hpPipeStage("disableDisplay-return");
+}
+
+// CTL2 is the driver requester. Acquire only bits missing from this request;
+// on admission failure undo our additions before invoking any donor modeset.
+static bool hpPreparePipePower() {
+ auto *ng=NGreen::callback;
+ uint32_t added=0;
+ const unsigned indices[]={1,6};
+ for(unsigned index:indices) {
+  const uint32_t request=2u<<(2*index), state=request>>1;
+  const uint32_t fuse=1u<<(26-index);
+  uint32_t initial=ng->readReg32(0x45404);
+  if(initial==0xffffffffu)break;
+  if(!(initial&request)){
+   ng->writeReg32(0x45404,initial|request);
+   added|=request;
+  }
+  bool ready=false;
+  for(unsigned attempt=0;attempt<100;++attempt){
+   uint32_t current=ng->readReg32(0x45404), dist=ng->readReg32(0x42000);
+   if(current==0xffffffffu||dist==0xffffffffu)break;
+   if((current&(state|request))==(state|request)&&(dist&fuse)){ready=true;break;}
+   IODelay(10);
+  }
+  if(!ready)break;
+  if(index==6)return true;
+ }
+ const unsigned reverseRequests[]={0x2000u,8u};
+ for(unsigned bit:reverseRequests) {
+  if(!(added&bit))continue;
+  auto current=ng->readReg32(0x45404);
+  if(current!=0xffffffffu)ng->writeReg32(0x45404,current&~bit);
+ }
+ return false;
+}
+static mach_vm_address_t hpSafeModesetOriginal=0;
+static volatile uint32_t hpSafeModesetRejected=0;
+static int hpSafeModeset(void *controller,void *framebuffer,void *path,const IODetailedTimingInformationV2 *timing) {
+ using Original=int(*)(void*,void*,void*,const IODetailedTimingInformationV2*);
+ const uint32_t fb=framebuffer?getMember<uint32_t>(framebuffer,0x1dc):0xffffffffu;
+ void *port=path?getMember<void*>(path,0x3648):nullptr;
+ const uint32_t *desc=port?getMember<const uint32_t*>(port,0x548):nullptr;
+ if(fb==1 && (!desc || desc[0]==1)) {
+  // Snapshot only. Do not reassign a PLL from this admission guard.
+  uint32_t regs[]={1,0x164280,0,0x46010,0,0x46014,0,0x64000,0,0x64100,0,0x51004,0,0x46000,0};
+  for(unsigned i=1;i+1<sizeof(regs)/sizeof(regs[0]);i+=2)
+   regs[i+1]=NGreen::callback->readReg32(regs[i]);
+  auto *snapshot=OSData::withBytes(regs,sizeof(regs));
+  if(snapshot){NGreen::callback->publishHPClockAdmission(snapshot);snapshot->release();}
+  auto *ng=NGreen::callback;
+  bool measured=HPHDMI::pll0Admission(regs[2],regs[8],regs[10],regs[4],regs[6],regs[12]);
+  bool reuse=HPHDMI::pll0Reuse(hpPll0Active,regs[2],regs[8],regs[10],regs[4],regs[6],regs[12]);
+  bool mode=timing&&timing->pixelClock==148500000ULL&&timing->horizontalActive==1920&&timing->verticalActive==1080;
+  if(hpRgb8Required)mode=mode&&hpRgb8Ready&&HPHDMI::rgb8Request(timing->pixelEncoding,timing->bitsPerColorComponent,timing->dynamicRange);
+  if(hpPll0Trial&&hpPll0Hooks&&hpScopeReady&&hpDpTimingReady&&!hpPll0Fault&&mode&&desc&&desc[2]==2&&desc[3]==0&&(measured||reuse)) {
+   if(!hpEnablePipeOriginal||!hpDisableDisplayOriginal||!hpWorkLoopAddress)return kIOReturnNotReady;
+   auto *loop=reinterpret_cast<IOWorkLoop*(*)(const void*)>(hpWorkLoopAddress)(controller);
+   if(!loop||!loop->inGate()) { IOLog("HPPIPE31 external modeset outside controller gate\n");return kIOReturnNotReady; }
+   __sync_lock_test_and_set(&hpPipeTraceArmed,1u);
+   hpPipeStage("before-power");
+   if(!hpPreparePipePower()){hpPipeStage("power-refused");hpPll0Fault=true;return kIOReturnNotReady;}
+   hpPipeStage("before-modeset");
+   ng->publishHPRepeat(reuse);
+   hpPll0Active=true;
+   int result=reinterpret_cast<Original>(hpSafeModesetOriginal)(controller,framebuffer,path,timing);
+   hpPipeStage("modeset-return");
+   hpScanoutSnapshot();
+   bool locked=(ng->readReg32(0x46010)&0xc0000000u)==0xc0000000u;
+   bool panel=(ng->readReg32(0x164280)&0x403u)==1u&&
+              (ng->readReg32(0x46014)&0xc0000000u)==0xc0000000u;
+   ng->publishHPPll0(true,locked&&panel&&result==0);
+   uint32_t pipe=ng->readReg32(0x71008),transcoder=ng->readReg32(0x61400);
+   uint32_t firstFrame=ng->readReg32(0x71040),lastFrame=firstFrame;
+   bool running=HPHDMI::nativeBRunning(pipe,transcoder),progress=false;
+   if(!result&&locked&&panel&&running&&!hpPll0Fault) {
+    struct Io {
+     void delay(unsigned us){IODelay(us);}
+     uint32_t frame(){return NGreen::callback->readReg32(0x71040);}
+    } io;
+    progress=HPHDMI::waitNativeBFrame(io,firstFrame,lastFrame);
+   }
+   const uint32_t completion[]={1,static_cast<uint32_t>(result),locked,panel,pipe,transcoder,firstFrame,lastFrame,progress};
+   auto *completionData=OSData::withBytes(completion,sizeof(completion));
+   if(completionData){ng->publishHPCompletion(completionData);completionData->release();}
+   if(!locked||!panel||result||hpPll0Fault||!running||!progress){hpPll0Fault=true;return kIOReturnNotReady;}
+   const uint32_t beforeGamma=ng->readReg32(0x4ac80);
+   if(beforeGamma!=0xffffffffu) {
+    if(beforeGamma)ng->writeReg32(0x4ac80,0);
+    uint32_t evidence[]={1,beforeGamma,ng->readReg32(0x4ac80)};
+    auto *data=OSData::withBytes(evidence,sizeof(evidence));
+    if(data){ng->publishHPGammaB(data);data->release();}
+   }
+   return result;
+  }
+  uint32_t count=__sync_add_and_fetch(&hpSafeModesetRejected,1u);
+  NGreen::callback->publishHPSafeReject(count);
+  if(count<=4)IOLog("HPHDMI SAFE: external FB1 modeset rejected before clock/pipeline changes\n");
+  return kIOReturnUnsupported;
+ }
+ return reinterpret_cast<Original>(hpSafeModesetOriginal)(controller,framebuffer,path,timing);
+}
+
+static void hpInstallNativeDdc(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,KernelPatcher::KextInfo *activeKext) {
+ if(!hpNativeDdcEnabled())return;
+ auto solve=[&](const char *name,const uint8_t *prefix,size_t length) {
+  auto p=patcher.solveSymbol(index,name,address,size);patcher.clearError();
+  return p>=address && p-address<=size && length<=size-(p-address) &&
+         !memcmp(reinterpret_cast<const void*>(p),prefix,length)?p:mach_vm_address_t(0);
+ };
+ auto ddc=solve("__ZN14AppleIntelPort11getDDCBlockEjPhb",hpGetDDCPrefix,sizeof(hpGetDDCPrefix));
+ auto gmbus=solve("__ZN24AppleIntelBaseController16hwDoGMBusRequestEjjP12IOI2CRequest",hpGMBusPrefix,sizeof(hpGMBusPrefix));
+ auto loop=solve("__ZNK24AppleIntelBaseController11getWorkLoopEv",hpWorkLoopPrefix,sizeof(hpWorkLoopPrefix));
+ auto ctl=patcher.solveSymbol(index,"_gController",address,size);patcher.clearError();
+
+ // Validate every site before patching; do not call the known-broken native
+ // GMBUS function if either CPU-level fix or the exact read hook is unavailable.
+ bool cpuReady=gmbus && size>=0x7bf71 && gmbus==address+0x7b470;
+ auto argument=reinterpret_cast<uint8_t*>(gmbus+0x3c7);
+ auto reset=reinterpret_cast<uint8_t*>(gmbus+0x36b);
+ if(cpuReady)cpuReady=!memcmp(argument,HPHDMI::GmbusArgumentBefore,sizeof(HPHDMI::GmbusArgumentBefore))&&
+                      !memcmp(reset,HPHDMI::GmbusResetBefore,sizeof(HPHDMI::GmbusResetBefore));
+ auto read=solve("__ZN31AppleIntelRegisterAccessManager14ReadRegister32Em",HPHDMI::GmbusReadPrefix,sizeof(HPHDMI::GmbusReadPrefix));
+ cpuReady=cpuReady&&read;
+ if(cpuReady) {
+  KernelPatcher::LookupPatch a {activeKext,HPHDMI::GmbusArgumentBefore,HPHDMI::GmbusArgumentAfter,sizeof(HPHDMI::GmbusArgumentBefore),1};
+  patcher.applyLookupPatch(&a,argument,sizeof(HPHDMI::GmbusArgumentBefore)+1);patcher.clearError();
+  KernelPatcher::LookupPatch r {activeKext,HPHDMI::GmbusResetBefore,HPHDMI::GmbusResetAfter,sizeof(HPHDMI::GmbusResetBefore),1};
+  patcher.applyLookupPatch(&r,reset,sizeof(HPHDMI::GmbusResetBefore)+1);patcher.clearError();
+  cpuReady=!memcmp(argument,HPHDMI::GmbusArgumentAfter,sizeof(HPHDMI::GmbusArgumentAfter))&&
+           !memcmp(reset,HPHDMI::GmbusResetAfter,sizeof(HPHDMI::GmbusResetAfter));
+  if(cpuReady) {
+   KernelPatcher::RouteRequest readRoutes[]={{"__ZN31AppleIntelRegisterAccessManager14ReadRegister32Em",hpGmbusRead,hpGmbusReadOriginal}};
+   cpuReady=patcher.routeMultiple(index,readRoutes,address,size);patcher.clearError();
+   if(cpuReady)hpGmbusPollReturn=gmbus+0xb01;
+  }
+ }
+ NGreen::callback->publishHPGmbusCpuReady(cpuReady);
+ bool valid=cpuReady&&ddc&&gmbus&&loop&&ctl>=address&&ctl-address<=size&&sizeof(void*)<=size-(ctl-address);
+ if(valid){
+  hpGmbusAddress=gmbus;hpWorkLoopAddress=loop;hpControllerAddress=ctl;
+  KernelPatcher::RouteRequest routes[]={{"__ZN14AppleIntelPort11getDDCBlockEjPhb",hpNativeDdc,hpDdcOriginal}};
+  valid=patcher.routeMultiple(index,routes,address,size);patcher.clearError();
+ }
+ hpGmbusHookActive=valid;
+ hpIndexedDdcEnabled=valid&&checkKernelArgument("-ngreenhpindexedddc");
+ hpRgb8Required=checkKernelArgument("-ngreenhprgb8");
+ if(valid&&hpRgb8Required) {
+  static_assert(sizeof(IOFBDisplayModeDescription)==0xcc,"Donor timing description ABI");
+  static_assert(offsetof(IOFBDisplayModeDescription,timingInfo.detailedInfo.v2.pixelEncoding)==0xb4,"Donor wire format offset");
+  static const uint8_t prefix[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x28,0x01,0,0};
+  auto fn=solve("__ZN21AppleIntelFramebuffer22validateDetailedTimingEPvy",prefix,sizeof(prefix));
+  if(fn==address+0x45a8e) {
+   KernelPatcher::RouteRequest routes[]={{"__ZN21AppleIntelFramebuffer22validateDetailedTimingEPvy",hpValidateTiming,hpValidateTimingOriginal}};
+   hpRgb8Ready=patcher.routeMultiple(index,routes,address,size);patcher.clearError();
+  }
+  NGreen::callback->publishHPWire(hpRgb8Ready);
+ }
+ if(valid && checkKernelArgument("-ngreenhptmdstimings")) {
+  static const uint8_t prefix[]={0x55,0x48,0x89,0xe5,0x48,0x83,0xec,0x10};
+  auto fn=solve("__ZN24AppleIntelBaseController14setupDPTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParams",prefix,sizeof(prefix));
+  if(fn==address+0x6f6b4) {
+   KernelPatcher::RouteRequest routes[]={{"__ZN24AppleIntelBaseController14setupDPTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParams",hpDpTimings,hpDpTimingsOriginal}};
+   hpDpTimingReady=patcher.routeMultiple(index,routes,address,size);patcher.clearError();
+  }
+ }
+ if(valid && checkKernelArgument("-ngreenhphdmisafe")) {
+  const char *disableName="__ZN24AppleIntelBaseController14disableDisplayEP21AppleIntelFramebufferP21AppleIntelDisplayPathh";
+  const uint8_t disableEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x88,0,0,0};
+  if(solve(disableName,disableEntry,sizeof(disableEntry))==address+0x7086c){
+   KernelPatcher::RouteRequest trace[]={{disableName,hpTraceDisableDisplay,hpDisableDisplayOriginal}};
+   if(!patcher.routeMultiple(index,trace,address,size))hpDisableDisplayOriginal=0;
+   patcher.clearError();
+  }
+  const char *enableName="__ZN24AppleIntelBaseController10enablePipeEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2";
+  const uint8_t entry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x58};
+  if(solve(enableName,entry,sizeof(entry))==address+0x67ac2){
+   KernelPatcher::RouteRequest trace[]={{enableName,hpTraceEnablePipe,hpEnablePipeOriginal}};
+   if(!patcher.routeMultiple(index,trace,address,size))hpEnablePipeOriginal=0;
+   patcher.clearError();
+  }
+  static const uint8_t prefix[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53};
+  auto fn=solve("__ZN24AppleIntelBaseController9hwSetModeEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2",prefix,sizeof(prefix));
+  bool ok=false;
+  if(fn==address+0x74c1e) {
+   KernelPatcher::RouteRequest routes[]={{"__ZN24AppleIntelBaseController9hwSetModeEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2",hpSafeModeset,hpSafeModesetOriginal}};
+   ok=patcher.routeMultiple(index,routes,address,size);patcher.clearError();
+  }
+  NGreen::callback->publishHPSafeHook(ok);
+ }
+ if(valid && checkKernelArgument("-ngreenhphdmiscope")) {
+  static const uint8_t clockPrefix[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x58};
+  auto clock=solve("__ZN24AppleIntelBaseController12enableClocksEP14AppleIntelPortS1_P11ClockParams",clockPrefix,sizeof(clockPrefix));
+  bool ok=false;
+  if(clock==address+0xa5dae) {
+   KernelPatcher::RouteRequest routes[]={{"__ZN24AppleIntelBaseController12enableClocksEP14AppleIntelPortS1_P11ClockParams",hpEnableClocks,hpEnableClocksOriginal}};
+   ok=patcher.routeMultiple(index,routes,address,size);patcher.clearError();
+  }
+  hpScopeReady=ok;
+  NGreen::callback->publishHPScope(ok);
+ }
+
+ if(valid && checkKernelArgument("-ngreenhphdmifrac")) {
+  static const uint8_t prefix[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18};
+  auto fn=solve("__ZN24AppleIntelBaseController20calculatePllDivisorsEjP21AppleIntelDisplayPath",prefix,sizeof(prefix));
+  bool routed=false;
+  if(fn==address+0xa5708) {
+   KernelPatcher::RouteRequest routes[]={{"__ZN24AppleIntelBaseController20calculatePllDivisorsEjP21AppleIntelDisplayPath",hpPllDivisors,hpPllDivisorsOriginal}};
+   routed=patcher.routeMultiple(index,routes,address,size);patcher.clearError();
+  }
+  NGreen::callback->publishHPFraction(false,routed);
+ }
+
+
+ hpPll0Trial=checkKernelArgument("-ngreenhptmdspll0");
+ if(valid&&hpPll0Trial) {
+  static const uint8_t prefix[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x83,0xec,0x30};
+  auto fn=solve("__ZN24AppleIntelBaseController13disableClocksEP14AppleIntelPortS1_",prefix,sizeof(prefix));
+  if(fn==address+0xa6ed4) {
+   KernelPatcher::RouteRequest routes[]={{"__ZN24AppleIntelBaseController13disableClocksEP14AppleIntelPortS1_",hpDisableClocks,hpDisableClocksOriginal}};
+   hpPll0Hooks=patcher.routeMultiple(index,routes,address,size);patcher.clearError();
+  }
+ }
+ NGreen::callback->publishHPPll0(hpPll0Hooks&&hpScopeReady&&hpDpTimingReady,false);
+
+ // Do not replace Apple's HPD decision with a result derived from our unproven
+ // EDID transport. Keep the native HPD implementation untouched until GMBUS
+ // has produced and validated an EDID on this machine.
+ NGreen::callback->publishHPHpdRoute(false);
+ NGreen::callback->publishHPDDCRoute(valid);
+ if(!valid){hpGmbusAddress=hpWorkLoopAddress=hpControllerAddress=0;}
+ SYSLOG("ngreen","HP native DDC bridge: exact donor route %s",valid?"installed":"refused");
+}
+
 // xe/blitscratch2: definidos em kern_green.cpp (wrapLockCpu)
 extern void *volatile gXeBlitMem, *volatile gXeBlitCpu;
 static volatile uint32_t gXeGtFreqApple = 0, gXeGtFreqN = 0;  // XE-GTFREQ: último pedido da Apple, nº de pedidos
@@ -61,13 +604,112 @@ static void xeTopoArgs() {
 	if (gTopoParsed) return;
 	gTopoParsed = true;
 	uint32_t eu = 0, l3 = 0;
+    if (NGreen::callback && NGreen::callback->getHPA7A1Profile()) {
+        gTopoSs = HPA7A1::NativeSubslices;
+        gTopoL3 = HPA7A1::L3Banks;
+        SYSLOG("ngreen", "HP A7A1: qualified 80 EU / 10 native subslices / 6 L3 banks");
+        return;
+    }
 	if (PE_parse_boot_argn("ngreen-eu", &eu, sizeof(eu)) && (eu == 48 || eu == 64 || eu == 80 || eu == 96)) gTopoSs = eu / 8;
 	if (PE_parse_boot_argn("ngreen-l3", &l3, sizeof(l3)) && l3 >= 2 && l3 <= 16 && !(l3 & 1)) gTopoL3 = l3;
 }
 static void *volatile gTopoAcc = nullptr;
+static volatile uint32_t gRc2Pre = 0xFFFFFFFFU, gRc2Post = 0xFFFFFFFFU, gRc2N = 0;   // xe/rowchk: 0xe4f4 before/after (last start)
+// xe/auxbl (#15): backlight over eDP AUX for panels that ignore the PWM pin (OLED). Off by default.
+//   ngreenauxbl=1  VESA eDP (DPCD 0x720-0x723, like Linux drm_edp_backlight); =2 same and PWM duty pinned at 100% (test)
+//   ngreenauxbl=3  Intel HDR TCON (Linux intel_dp_aux_hdr_*: 0x344 bit 4 AUX enable, nits at 0x354); =4 same + PWM pinned
+//   ngreenauxnits=N  panel maximum in nits for 3/4 (default 400, minimum sent 2)
+// Apple's duty write (BLC_PWM_PCH_CTL2) sets the level; the AUX writes run on a thread call with Apple's own
+// AppleIntelPort::readAUX/writeAUX. Arms only if the panel advertises the interface: VESA needs 0x701 bit 2 and 0x702
+// bit 1, Intel HDR needs 0x341 bit 4. ioreg on IntelAccelerator: xe-dpcd700-0..3 / xe-dpcd340 (caps, little-endian),
+// xe-auxbl-n (writes), -ret, -lvl (last level or nits), -rb (read back).
+static volatile uint32_t gXeDpcd700[4] = {0, 0, 0, 0}, gXeDpcd700Ret = 0xFFFFFFFFU, gXeDpcd340 = 0, gXeDpcd340Ret = 0xFFFFFFFFU;
+static void *volatile gXeAuxBlPort = nullptr;
+static mach_vm_address_t gXeAuxBlWr = 0, gXeAuxBlRd = 0;
+static thread_call_t gXeAuxBlTc = nullptr;
+static volatile uint32_t gXeAuxBlLevel = 0, gXeAuxBlN = 0, gXeAuxBlRet = 0xFFFFFFFFU, gXeAuxBlRb = 0, gXeAuxBlDone = 0;
+static int xeAuxBlMode() {
+	static int m = -1;
+	if (m < 0) { int v = 0; m = PE_parse_boot_argn("ngreenauxbl", &v, sizeof(v)) && v > 0 && v < 5 ? v : 0; }
+	return m;
+}
+static bool xeAuxBlHdr() { return xeAuxBlMode() >= 3; }
 static void xeTopoPublish(thread_call_param_t, thread_call_param_t) {
 	auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gTopoAcc));
 	if (svc) svc->setProperty("xe-topo", (gTopoSs * 8) << 8 | gTopoL3, 32);
+	if (svc && gXeDpcd700Ret != 0xFFFFFFFFU) {
+		char k[20];
+		for (int i = 0; i < 4; i++) { snprintf(k, sizeof(k), "xe-dpcd700-%d", i); svc->setProperty(k, gXeDpcd700[i], 32); }
+		svc->setProperty("xe-dpcd700-ret", gXeDpcd700Ret, 32);
+		svc->setProperty("xe-dpcd340", gXeDpcd340, 32);
+		svc->setProperty("xe-dpcd340-ret", gXeDpcd340Ret, 32);
+	}
+	if (svc && gXeAuxBlN) {
+		svc->setProperty("xe-auxbl-n", gXeAuxBlN, 32);
+		svc->setProperty("xe-auxbl-ret", gXeAuxBlRet, 32);
+		svc->setProperty("xe-auxbl-lvl", gXeAuxBlDone, 32);
+		svc->setProperty("xe-auxbl-rb", gXeAuxBlRb, 32);
+	}
+	if (svc && gRc2N) {
+		svc->setProperty("xe-rowchk-pre", gRc2Pre, 32);
+		svc->setProperty("xe-rowchk-post", gRc2Post, 32);
+		svc->setProperty("xe-rowchk-n", gRc2N, 32);
+	}
+}
+static thread_call_t gTopoTc = nullptr;
+
+// xe/portguard (#8, #22, #28): AppleIntelPort::probePortState() calls the port's probePortMode() through vtable slot
+// 0x190 right after "HPD is high" (16.0.32 debug FB: call *0x190(%rax) at 0x2eb0b, return address = +0x207). In the
+// abstract base AppleIntelPort vtable (__ZTV14AppleIntelPort) that slot, and getHPDState at 0x180, are
+// ___cxa_pure_virtual; in AppleIntelPortHAL / AppleIntelPortHALDiags it is AppleIntelPortHAL::probePortMode (HookCase).
+// Three machines (HDMI-only desktop, eDP MoDT, ADL-S VGA bridge) panic there from WindowServer's enableController; the
+// XPS never does (its eDP port takes the built-in branch, which never reaches the call). The wrapper checks the
+// object's vptr: if slot 0x190 is the pure-virtual stub it does what Apple does when the sink can't be probed
+// (setPortMode(0) through vtable slot 0x138, state 2 into this+0x554, return 2) instead of calling it; otherwise, and for
+// a port that would take the built-in branch, it calls the original untouched. Logged once per port. On by default on
+// the spoofed path; off: -ngreennoportguard. The old byte patch f13b (mov eax,1 for every port) stays disabled.
+static mach_vm_address_t gXePortGuardOrg = 0, gXePureVirtual = 0, gXePureVirtualBase = 0, gXeGControllerSym = 0;
+static volatile uint32_t gXePortGuardN = 0;
+static mach_vm_address_t gXeInitHwCaps = 0;   // xe/hwcaps114c (#5), see xeHwCapsFill
+static void *volatile gXePortGuardSeen[16] = {};
+static uint32_t xePortGuardProbe(void *that) {
+	if (that && (gXePureVirtual || gXePureVirtualBase)) {
+		auto *vt = *reinterpret_cast<mach_vm_address_t *const *>(that);
+		const mach_vm_address_t slot = vt ? vt[0x190 / 8] : 0;
+		if (slot && (slot == gXePureVirtual || slot == gXePureVirtualBase)) {
+			// Apple's built-in branch (portInfo+0x14 bit 3 and !(gController->0xd40->0xf8 & 0x20)): setPortMode(1),
+			// state 2, without the vcall. Leave that one to the original.
+			auto *info = getMember<uint8_t *>(that, 0x548);
+			bool builtin = false;
+			if (info && (info[0x14] & 0x8) && gXeGControllerSym) {
+				auto *ctl = *reinterpret_cast<uint8_t **>(gXeGControllerSym);
+				auto *sub = ctl ? *reinterpret_cast<uint8_t **>(ctl + 0xd40) : nullptr;
+				builtin = sub && !(sub[0xf8] & 0x20);
+			}
+			if (!builtin) {
+				const mach_vm_address_t spm = vt[0x138 / 8];
+				if (spm && spm != gXePureVirtual && spm != gXePureVirtualBase)
+					reinterpret_cast<void (*)(void *, uint32_t)>(spm)(that, 0);
+				getMember<uint32_t>(that, 0x554) = 2;
+				OSIncrementAtomic(&gXePortGuardN);
+				bool seen = false;
+				for (size_t i = 0; i < arrsize(gXePortGuardSeen) && !seen; i++) {
+					if (gXePortGuardSeen[i] == that) seen = true;
+					else if (!gXePortGuardSeen[i] && OSCompareAndSwapPtr(nullptr, that, &gXePortGuardSeen[i])) break;
+				}
+                if (!seen && NGreen::callback && NGreen::callback->getHPA7A1Profile()) {
+                    uint32_t record[] = {1, info ? *reinterpret_cast<uint32_t *>(info) : 0xFFFFFFFFU, gXePortGuardN};
+                    OSData *data = OSData::withBytes(record, sizeof(record));
+                    if (data) { NGreen::callback->publishHPProbeRecord(data); data->release(); }
+                }
+				if (!seen && gXePortGuardN <= 64)
+					IOLog("XeNG PORTGUARD: port %p ddi %u: probePortMode (vtable 0x190) is pure virtual -> setPortMode(0), state 2 (n=%u)\n",
+						  that, info ? *reinterpret_cast<uint32_t *>(info) : 0xFFFFFFFFU, gXePortGuardN);
+				return 2;
+			}
+		}
+	}
+	return FunctionCast(xePortGuardProbe, gXePortGuardOrg)(that);
 }
 
 // ==== 6 kextInfos: ICL fallback + dual TGL identities (com.xxxxx and com.apple) from /Library/Extensions ====
@@ -1219,6 +1861,26 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		gTglFbBlockRuns++;
 		this->tglFBLoaded = true;
 		auto *activeKext = (kextG11FBTA.loadIndex == index) ? &kextG11FBTA : &kextG11FBT;
+        hpInstallNativeDdc(patcher,index,address,size,activeKext);
+
+        if (NGreen::callback->hpA7A1Profile && NGreen::callback->stolen_size == HPA7A1::DVMT60) {
+            const auto fbInit = patcher.solveSymbol(index, "__ZN24AppleIntelBaseController13FBMemMgr_InitEv", address, size);
+            patcher.clearError();
+            // Exact donor function and instruction/store fingerprint. An EFI
+            // DVMT patch may already have corrected this same sequence.
+            PANIC_COND(size < 0x5E227 + sizeof(HPA7A1::Original) || fbInit != address + 0x5E17A,
+                "ngreen", "HP DVMT: unqualified TGL framebuffer donor");
+            const auto state = HPA7A1::classify(reinterpret_cast<const uint8_t *>(fbInit + 0xAD), sizeof(HPA7A1::Original));
+            PANIC_COND(state == HPA7A1::Sequence::Unexpected, "ngreen", "HP DVMT: framebuffer instruction fingerprint mismatch");
+            if (state == HPA7A1::Sequence::Original) {
+                const LookupPatchPlus patches[] {{activeKext, HPA7A1::Original, HPA7A1::Corrected, sizeof(HPA7A1::Original), 1}};
+                PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches, address, size), "ngreen", "HP DVMT: calculation patch failed");
+            }
+            PANIC_COND(HPA7A1::classify(reinterpret_cast<const uint8_t *>(fbInit + 0xAD), sizeof(HPA7A1::Original)) != HPA7A1::Sequence::Corrected,
+                "ngreen", "HP DVMT: post-patch verification failed");
+            NGreen::callback->iGPU->setProperty("xe-hp-dvmt-patched", true);
+            SYSLOG("ngreen", "HP DVMT: FBMemMgr_Init uses actual 60 MiB; task cleanup and allocation checks preserved");
+        }
 		NGreen::callback->setRMMIOIfNecessary();
 		SYSLOG("ngreen", "init AppleIntelTGLGraphicsFramebuffer");
 		
@@ -1365,7 +2027,29 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			//{"__ZN21AppleIntelFramebuffer16enableControllerEv", isPanelPowerOn},
 		};
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route dp symbols");
+        // HP-only, explicit opt-in; report the documented hardware cursor capability
+        // as unavailable. No register writes or image modifications in this hook.
+        uint32_t hpSoftwareCursor = 0;
+        if (NGreen::callback && NGreen::callback->getHPA7A1Profile()) {
+            WIOKit::getOSDataValue(NGreen::callback->iGPU, "ngreen,hp-swcursor", hpSoftwareCursor);
+        }
+        if (hpSoftwareCursor == 1) {
+            RouteRequestPlus cursorRequests[] = {
+                {"__ZN21AppleIntelFramebuffer12getAttributeEjPm", hpCursorGetAttribute, this->oHPCursorGetAttribute},
+            };
+            bool installed = RouteRequestPlus::routeAll(patcher, index, cursorRequests, address, size);
+            NGreen::callback->iGPU->setProperty("xe-hp-swcursor-hook", installed);
+            if (!installed) {
+                SYSLOG("ngreen", "HP cursor: capability route unavailable; original cursor retained");
+                patcher.clearError();
+            }
+        }
+
 		gTglFbRoutesDone++;
+		if (xeAuxBlMode()) {
+			gXeAuxBlWr = patcher.solveSymbol(index, "__ZN14AppleIntelPort8writeAUXEjPvj", address, size);
+			patcher.clearError();
+		}
 		if (checkKernelArgument("-ngreenfixbootmode")) {
 			SolveRequestPlus crtcSolve[] = {
 				{"__ZN24AppleIntelBaseController35hwCRTCToIODetailedTimingInformationEP21AppleIntelFramebufferP29IODetailedTimingInformationV2", gHwCrtcToTimingAddr},
@@ -1378,6 +2062,28 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 					thread_call_enter_delayed(gFbtTc, deadline);
 				}
 			}
+		}
+		// xe/portguard (#8, #22, #28): spoofed path only, not fatal if a symbol is missing (prod FB has no symbols)
+		if (NGreen::callback && !NGreen::callback->isRealTGL && !checkKernelArgument("-ngreennoportguard")) {
+			gXePureVirtual = patcher.solveSymbol(KernelPatcher::KernelID, "___cxa_pure_virtual");
+			patcher.clearError();
+			const mach_vm_address_t baseVt = patcher.solveSymbol(index, "__ZTV14AppleIntelPort", address, size);
+			patcher.clearError();
+			if (baseVt) gXePureVirtualBase = *reinterpret_cast<const mach_vm_address_t *>(baseVt + 0x10 + 0x190);
+			gXeGControllerSym = patcher.solveSymbol(index, "_gController", address, size);
+			patcher.clearError();
+			if (gXePureVirtual || gXePureVirtualBase) {
+				KernelPatcher::RouteRequest pgRoutes[] = {
+					{"__ZN14AppleIntelPort14probePortStateEv", xePortGuardProbe, gXePortGuardOrg},
+				};
+				if (!patcher.routeMultiple(index, pgRoutes, address, size)) gXePortGuardOrg = 0;
+				patcher.clearError();
+			}
+			SYSLOG("ngreen", "XE-PORTGUARD: route=%d pure_virtual=0x%llx base slot 0x190=0x%llx gController=%d",
+				   gXePortGuardOrg != 0, (unsigned long long)gXePureVirtual, (unsigned long long)gXePureVirtualBase, gXeGControllerSym != 0);
+			IOLog("XeNG PORTGUARD: armed %d (pure_virtual %s, base vtable slot %s)\n", gXePortGuardOrg != 0,
+				  gXePureVirtual ? "ok" : "missing",
+				  !gXePureVirtualBase ? "missing" : gXePureVirtualBase == gXePureVirtual ? "= pure_virtual" : "differs");
 		}
 		gOrgGcdm = this->ogetCurrentDisplayMode; gOrgGpi = this->ogetPixelInformation; gOrgVdm = this->ovalidateDisplayMode;
 		SYSLOG("ngreen", "TGL FB routes applied (fixbootmode: getCurrentDisplayMode org=0x%llx, arg=%d)",
@@ -1602,6 +2308,31 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t f_tcon_banksia[] = {0x3d, 0x12, 0x14, 0xc4, 0x41};
 		static const uint8_t r_tcon_banksia[] = {0x3d, 0x14, 0x1e, 0xc4, 0xc1};
 		const bool enableTcon = checkKernelArgument("-ngreentglwithgfx");
+		const bool hpNativeHdmi = NGreen::callback && NGreen::callback->getHPA7A1Profile() &&
+		                          checkKernelArgument("-ngreenhphdmi") && hpNativeDdcEnabled();
+
+		// AppleIntelTGLGraphicsFramebuffer 16.0 uses Ice Lake DPLL CFGCR offsets.
+		// The HP Linux register capture independently identifies the TGL Combo-PHY
+		// table addresses below (DPLL0_CFGCR0/1 = 0x164284/0x164288). Patch only the
+		// known framebuffer donor and only for this explicit OCTEST profile.
+		if (hpNativeHdmi && !checkKernelArgument("-ngreenicldpll")) {
+			static const uint8_t fTglDpllRegs[48] = {
+				0x00,0x40,0x16,0x00,0x00,0x00,0x00,0x00, 0x80,0x40,0x16,0x00,0x00,0x00,0x00,0x00,
+				0x00,0x42,0x16,0x00,0x00,0x00,0x00,0x00, 0x04,0x40,0x16,0x00,0x00,0x00,0x00,0x00,
+				0x84,0x40,0x16,0x00,0x00,0x00,0x00,0x00, 0x04,0x42,0x16,0x00,0x00,0x00,0x00,0x00
+			};
+			static const uint8_t rTglDpllRegs[48] = {
+				0x84,0x42,0x16,0x00,0x00,0x00,0x00,0x00, 0x8c,0x42,0x16,0x00,0x00,0x00,0x00,0x00,
+				0x94,0x42,0x16,0x00,0x00,0x00,0x00,0x00, 0x88,0x42,0x16,0x00,0x00,0x00,0x00,0x00,
+				0x90,0x42,0x16,0x00,0x00,0x00,0x00,0x00, 0x98,0x42,0x16,0x00,0x00,0x00,0x00,0x00
+			};
+			LookupPatchPlus const dpllPatch[] = {{activeKext, fTglDpllRegs, rTglDpllRegs, sizeof(fTglDpllRegs), 1}};
+			const bool patched = LookupPatchPlus::applyAll(patcher, dpllPatch, address, size);
+			if (!patched) patcher.clearError();
+			if (NGreen::callback->iGPU)
+				NGreen::callback->iGPU->setProperty("HPHDMIDPLLRegisterTablePatched", patched ? kOSBooleanTrue : kOSBooleanFalse);
+			IOLog("HP-HDMI-DPLL: TGL Combo-PHY CFGCR table relocation %s\n", patched ? "applied" : "not matched");
+		}
 
 		if (isprod){
 			LookupPatchPlus const patchesp[] = {// tgl production kext
@@ -1631,7 +2362,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{activeKext, f6nb, r6nb, arrsize(f6nb),	1},
 				{activeKext, f13p, r13p, arrsize(f13p),	1},
 				{activeKext, f13pb, r13pb, arrsize(f13pb),	1},
-				{activeKext, f19, r19, arrsize(f19),	1},
 				{activeKext, f20p, r20p, arrsize(f20p),	1},
 				{activeKext, f24bp, r24bp, arrsize(f24bp),	14},
 				{activeKext, f24cp, r24cp, arrsize(f24cp),	1},
@@ -1640,6 +2370,18 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesp , address, size), "ngreen", "kextG11FBT Failed to apply production patches!");
+			if (!hpNativeHdmi) {
+				LookupPatchPlus const hpdSpoof[] = {{activeKext, f19, r19, arrsize(f19), 1}};
+				LookupPatchPlus::applyAll(patcher, hpdSpoof, address, size);
+			}
+            if (NGreen::callback && NGreen::callback->getHPA7A1Profile()) {
+                bool nativeProbe = false;
+                NGreen::callback->iGPU->setProperty("HPHDMINativeProbeEnabled", nativeProbe ? kOSBooleanTrue : kOSBooleanFalse);
+                const HPHDMI::Capabilities capabilities {};
+                NGreen::callback->iGPU->setProperty("HPHDMIBackendBlocker", static_cast<uint64_t>(capabilities.blocker()), 32);
+                NGreen::callback->iGPU->setProperty("HPHDMIEmulationActive", kOSBooleanFalse);
+                NGreen::callback->iGPU->setProperty("HPHDMISourceProfile", "HP-VBT253-HDMI-level0-PHYB-PLL0");
+            }
 			applyFixBootMode(patcher, activeKext, address, size);
 			if (enableTcon) {
 				LookupPatchPlus const tconPatches[] = {
@@ -1668,12 +2410,15 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				//{activeKext, f4c, r4c, arrsize(f4c),	2},
 		//		{activeKext, f6a, r6a, arrsize(f6a),	1},
 		//		{activeKext, f7, r7, arrsize(f7),	1},
-				// f10 ("hwreg" CALL+JZ→JMP bypass) commented out — NOT in NootedBlue.
-				{activeKext, f10, r10, arrsize(f10),	1},
 				// f13: mandatory. Without this port-probe bypass the spoofed TGL path freezes during boot.
-				{activeKext, f13, r13, arrsize(f13),	1},
+				// This call is in AppleIntelPowerWell::init, NOT probePortState.
+                // xePortGuardProbe cannot protect it. Keep the boot-required bypass.
+                {activeKext, f13, r13, arrsize(f13), 1},
 				// f13b: mandatory. Without this bypass AppleIntelPort::probePortStateEv hits
 				// a pure-virtual call and panics in WindowServer during enableController.
+				// xe/portguard: stays disabled (commented out as inherited from upstream 95f8189): it forced
+				// mode 1 for every HPD-high port, real HAL ports too. XE-PORTGUARD (xePortGuardProbe) covers
+				// the panic and only acts when the port's slot 0x190 is ___cxa_pure_virtual.
 		//		{activeKext, f13b, r13b, arrsize(f13b),	1},
 				// f15: suppress getPathByPipe log flood at IGLogLevel=8.
 				// On platform 0x9a490000 all paths are on pipe 0; every scan cycle logs
@@ -1682,7 +2427,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				// Purely cosmetic: no behavioral change, no display-pipe impact.
 				{activeKext, f15, r15, arrsize(f15),	1},
 				//{activeKext, f16, r16, arrsize(f16),	1},
-				{activeKext, f19, r19, arrsize(f19),	1},
 		//		{activeKext, f20, r20, arrsize(f20),	1},
 				//{activeKext, f21, r21, arrsize(f21),	1},
 				//{activeKext, f22, r22, arrsize(f22),    1},
@@ -1696,6 +2440,25 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
+			// f10 forces the old framebuffer fast path to skip LightUpTMDS. f19 spoofs
+			// HPD as a workaround for the old port layout. Keep both legacy patches off
+			// for the native HP DDI-B HDMI route so the external pipe gets Apple's real
+			// hotplug/modeset path; retain them on the non-HDMI fallback configuration.
+			if (!hpNativeHdmi) {
+				LookupPatchPlus const legacyPortPatches[] = {
+					{activeKext, f10, r10, arrsize(f10), 1},
+					{activeKext, f19, r19, arrsize(f19), 1},
+				};
+				PANIC_COND(!LookupPatchPlus::applyAll(patcher, legacyPortPatches, address, size), "ngreen", "kextG11FBT failed to apply legacy port patches!");
+			}
+            if (NGreen::callback && NGreen::callback->getHPA7A1Profile()) {
+                bool nativeProbe = false;
+                NGreen::callback->iGPU->setProperty("HPHDMINativeProbeEnabled", nativeProbe ? kOSBooleanTrue : kOSBooleanFalse);
+                const HPHDMI::Capabilities capabilities {};
+                NGreen::callback->iGPU->setProperty("HPHDMIBackendBlocker", static_cast<uint64_t>(capabilities.blocker()), 32);
+                NGreen::callback->iGPU->setProperty("HPHDMIEmulationActive", kOSBooleanFalse);
+                NGreen::callback->iGPU->setProperty("HPHDMISourceProfile", "HP-VBT253-HDMI-level0-PHYB-PLL0");
+            }
 			applyFixBootMode(patcher, activeKext, address, size);
 			if (enableTcon) {
 				LookupPatchPlus const tconPatches[] = {
@@ -2121,6 +2884,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{"__ZN16IntelAccelerator10getGPUInfoEv", getGPUInfo, this->ogetGPUInfo},
 			};
 			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, gpuInfoRoute, address, size), "ngreen", "Failed to route getGPUInfo");
+			// xe/hwcaps114c (#5): re-derives the subslice-dependent caps if the fuse read left them at 0 (see getGPUInfo)
+			gXeInitHwCaps = patcher.solveSymbol(index, "__ZN16IntelAccelerator16initHardwareCapsEv", address, size);
+			patcher.clearError();
 		}
 
 		// SKU/device-ID panic bypass (verified @ 0x23c1d in LE binary)
@@ -3382,15 +4148,18 @@ void Gen11::enableDisplayEngine(AppleIntel::AppleIntelBaseController *that)
 	FunctionCast(enableDisplayEngine, callback->oenableDisplayEngine)(that );
 }
 
-void Gen11::computeLaneCount(AppleIntel::AppleIntelBaseController *that, const IODetailedTimingInformationV2 *timing, unsigned int linkRate, unsigned int bpp, unsigned int *laneCount) {
-	if (!laneCount) return;
+bool Gen11::computeLaneCount(AppleIntel::AppleIntelBaseController *that, const IODetailedTimingInformationV2 *timing, unsigned int linkRate, unsigned int bpp, unsigned int *laneCount) {
+	if (!laneCount) return false;
 
 	// Call original first — handles all standard DP rates on both real TGL and spoofed paths.
-	FunctionCast(computeLaneCount, callback->ocomputeLaneCount)(that, timing, linkRate, bpp, laneCount);
+	const bool result = FunctionCast(computeLaneCount, callback->ocomputeLaneCount)(that, timing, linkRate, bpp, laneCount);
 
 	// Real TGL: preserve Apple's result unchanged.
-	if (NGreen::callback->isRealTGL)
-		return;
+	if (NGreen::callback->isRealTGL) return result;
+    if (hpNativeDdcEnabled()) {
+        const auto *info=getMember<const uint32_t*>(that,0x548);
+        if(!info||info[0]!=0)return result; // Firmware lane override is eDP-only.
+    }
 
 	// For !isRealTGL (RPL spoofed): Apple's DPCD-based result (MAX_LANE_COUNT) reflects
 	// the panel's capability, but UEFI/GOP may have trained the link at a different lane
@@ -3410,8 +4179,9 @@ void Gen11::computeLaneCount(AppleIntel::AppleIntelBaseController *that, const I
 			   v90L4Logs, linkRate, bpp, *laneCount, ddiA, hwLanes);
 	}
 
-	if (hwLanes > *laneCount)
+	if (result && hwLanes > *laneCount)
 		*laneCount = hwLanes;
+    return result;
 }
 
 // setupOptimalLaneCount is called by hwSetMode to pick the lane count that gets
@@ -3420,12 +4190,15 @@ void Gen11::computeLaneCount(AppleIntel::AppleIntelBaseController *that, const I
 // port->maxLaneCount (from DPCD MAX_LANE_COUNT, which is 2 on this panel).
 // On !isRealTGL we instead snap the cached count to match DDI_BUF_CTL_A so that
 // SetupParams builds TRANS_DDI_FUNC_CTL with the correct HW-trained lane field.
-void Gen11::setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, const IODetailedTimingInformationV2 *timing, unsigned int bpp) {
+IOReturn Gen11::setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, const IODetailedTimingInformationV2 *timing, unsigned int bpp) {
 	// Always run Apple's original first to populate all other LinkConfig fields.
-	FunctionCast(setupOptimalLaneCount, callback->osetupOptimalLaneCount)(that, timing, bpp);
+	const IOReturn result = FunctionCast(setupOptimalLaneCount, callback->osetupOptimalLaneCount)(that, timing, bpp);
 
-	if (NGreen::callback->isRealTGL)
-		return;
+	if (NGreen::callback->isRealTGL || result != kIOReturnSuccess) return result;
+    if(hpNativeDdcEnabled()) {
+        const auto *info=getMember<const uint32_t*>(that,0x548);
+        if(!info||info[0]!=0)return result;
+    }
 
 	// Read HW-trained lane count from DDI_BUF_CTL_A bits[3:1].
 	// PORT_WIDTH: 0=x1, 1=x2, 3=x4.
@@ -3438,7 +4211,9 @@ void Gen11::setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, co
 	// by IDA: str result into [x0 + offset] before returning).
 	// We patch it post-call so the cap-to-DPCD logic is overridden.
 	// Offset 0x148 is fOptimalLaneCount in AppleIntelPort on this kext version.
-	unsigned int &cached = getMember<unsigned int>(that, 0x148);
+	// Exact TGL donor setupOptimalLaneCount stores its result at +0x124.
+    // +0x148 is the beginning of the EDID cache, proven by getDDCBlock.
+    unsigned int &cached = getMember<unsigned int>(that, hpNativeDdcEnabled()?0x124:0x148);
 
 	static int v90L5Logs = 0;
 	if (v90L5Logs < 10) {
@@ -3449,11 +4224,69 @@ void Gen11::setupOptimalLaneCount(AppleIntel::AppleIntelBaseController *that, co
 
 	if (hwLanes > cached)
 		cached = hwLanes;
+    return result;
+}
+
+using XeAuxFn = uint32_t (*)(void *, uint32_t, void *, uint32_t);
+static void xeAuxBlApply(thread_call_param_t, thread_call_param_t) {
+	void *port = gXeAuxBlPort;
+	if (!port || !gXeAuxBlWr || !gXeAuxBlRd) return;
+	auto wr = [&](uint32_t a, void *b, uint32_t n) { return reinterpret_cast<XeAuxFn>(gXeAuxBlWr)(port, a, b, n); };
+	auto rd = [&](uint32_t a, void *b, uint32_t n) { return reinterpret_cast<XeAuxFn>(gXeAuxBlRd)(port, a, b, n); };
+	const uint32_t lvl = gXeAuxBlLevel;
+	uint32_t ret, rb = 0, done;
+	if (xeAuxBlHdr()) {
+		static int maxNits = 0;
+		if (!maxNits && (!PE_parse_boot_argn("ngreenauxnits", &maxNits, sizeof(maxNits)) || maxNits < 10 || maxNits > 2000)) maxNits = 400;
+		uint32_t nits = lvl ? (uint32_t)(((uint64_t)lvl * (uint32_t)maxNits + 0x7FFF) / 0xFFFF) : 0;
+		if (lvl && nits < 2) nits = 2;
+		uint8_t c = 0;
+		ret = rd(0x344, &c, 1);
+		if (!ret && !(c & 0x10)) { c |= 0x10; ret = wr(0x344, &c, 1); }   // brightness AUX enable
+		uint8_t pkt[4] = {(uint8_t)nits, (uint8_t)(nits >> 8), 0, 0};
+		if (!ret) ret = wr(0x354, pkt, 4);
+		uint8_t c2 = 0;
+		rd(0x354, &rb, 4);
+		rd(0x344, &c2, 1);
+		rb = (rb & 0xFFFF) | ((uint32_t)c2 << 24);
+		done = nits;
+	} else {
+		const bool wide = (gXeDpcd700[0] >> 16) & 0x4;   // 0x702 bit 2: 16-bit level
+		uint8_t v[2] = {(uint8_t)(lvl >> 8), (uint8_t)lvl};
+		ret = wr(0x722, v, wide ? 2 : 1);
+		uint8_t m = 0, c = 0;
+		if (!ret && !(ret = rd(0x721, &m, 1)) && (m & 3) != 2) { m = (uint8_t)((m & ~3U) | 2); ret = wr(0x721, &m, 1); }   // DPCD mode
+		if (!ret && !(ret = rd(0x720, &c, 1)) && !(c & 1)) { c |= 1; ret = wr(0x720, &c, 1); }                             // backlight enable
+		rd(0x720, &rb, 4);
+		done = lvl;
+	}
+	gXeAuxBlRet = ret; gXeAuxBlRb = rb; gXeAuxBlDone = done;
+	if (OSIncrementAtomic(&gXeAuxBlN) < 8) IOLog("XeNG AUXBL: mode %d level 0x%x ret 0x%x rb 0x%08x\n", xeAuxBlMode(), done, ret, rb);
+	xeTopoPublish(nullptr, nullptr);
 }
 
 IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
 
 	IOReturn retVal = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, address, buffer, length);
+	if (retVal == kIOReturnSuccess && address == 0 && buffer && length >= 16 && gXeDpcd700Ret == 0xFFFFFFFFU) {
+		// xe/auxbl: eDP backlight caps, read once next to Apple's first sink-caps read (read only)
+		uint32_t caps[4] = {0, 0, 0, 0}, hdr = 0;
+		gXeDpcd700Ret = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, 0x700, caps, 16);
+		for (int i = 0; i < 4; i++) gXeDpcd700[i] = caps[i];
+		gXeDpcd340Ret = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, 0x340, &hdr, 4);
+		gXeDpcd340 = hdr;
+		const bool vesaOk = gXeDpcd700Ret == 0 && ((caps[0] >> 8) & 0x4) && ((caps[0] >> 16) & 0x2);
+		const bool hdrOk = gXeDpcd340Ret == 0 && ((hdr >> 8) & 0x10);
+		// -ngreenauxblforce (#15): arm even if the panel doesn't advertise the interface (0x341 bit 4 / 0x701-0x702)
+		const bool force = xeAuxBlMode() && checkKernelArgument("-ngreenauxblforce");
+		if (xeAuxBlMode() && gXeAuxBlWr && (force || (xeAuxBlHdr() ? hdrOk : vesaOk))) {
+			gXeAuxBlRd = callback->orgICLReadAUX;
+			gXeAuxBlTc = thread_call_allocate(xeAuxBlApply, nullptr);
+			if (gXeAuxBlTc) gXeAuxBlPort = that;
+		}
+		IOLog("XeNG AUXBL: caps 0x700 %08x 0x340 %08x mode %d armed %d%s\n", caps[0], hdr, xeAuxBlMode(), gXeAuxBlPort ? 1 : 0,
+			  force ? " (forced)" : "");
+	}
 
 	// V97AUX: log first ~40 AUX reads to diagnose eDP link training failures.
 	static int auxLogCount = 0;
@@ -3544,6 +4377,15 @@ void Gen11::getOnlineInfo(AppleIntel::AppleIntelFramebuffer *that, AppleIntel::A
 	FunctionCast(getOnlineInfo, callback->ogetOnlineInfo)(that, displayPath, online, changed);
 	uint32_t fbId = getMember<uint32_t>(that, 0x1DC);
 	unsigned char origOnline = online ? *online : 0xFF;
+    static uint32_t hpPowerReports = 0;
+    if (NGreen::callback->getHPA7A1Profile() && checkKernelArgument("-ngreenhphdmiio") &&
+        fbId == 1 && hpPowerReports++ < 4) {
+        const uint32_t ddi = NGreen::callback->readReg32(0x45454);
+        NGreen::callback->iGPU->setProperty("HPHDMIDDIPowerReadback", static_cast<uint64_t>(ddi), 32);
+        NGreen::callback->iGPU->setProperty("HPHDMIDDIBRequest", (ddi & 8) ? kOSBooleanTrue : kOSBooleanFalse);
+        NGreen::callback->iGPU->setProperty("HPHDMIDDIBPowered", (ddi & 4) ? kOSBooleanTrue : kOSBooleanFalse);
+    }
+
 	static int v96PassLogs = 0;
 	if (v96PassLogs < 12) {
 		v96PassLogs++;
@@ -3913,6 +4755,25 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 					val = v > gBlHwFreq ? gBlHwFreq : (uint32_t)v;
 				}
 				gBlLastOut = val;
+				if (xeAuxBlMode() && gXeAuxBlTc && gBlHwFreq && gBlHwFreq != 0xFFFFFFFF) {   // xe/auxbl
+					uint64_t l = (uint64_t)val * 0xFFFF / gBlHwFreq;
+					gXeAuxBlLevel = l > 0xFFFF ? 0xFFFF : (uint32_t)l;
+					thread_call_enter(gXeAuxBlTc);
+					if ((xeAuxBlMode() == 2 || xeAuxBlMode() == 4) && val) val = gBlHwFreq;
+				} else if (xeAuxBlMode() && gXeAuxBlTc) {
+					// xe/auxbl (#15): no usable PWM period in 0xC8254 (0 or all-ones, e.g. OLED panels with no PWM
+					// backlight): the duty is still in Apple's units, so scale against ngreenblmax or Apple's own period.
+					// The PWM write itself goes through unchanged.
+					const uint32_t den = blmax > 0 ? (uint32_t)blmax : gBlAppleFreq;
+					if (den) {
+						uint64_t l = (uint64_t)val * 0xFFFF / den;
+						gXeAuxBlLevel = l > 0xFFFF ? 0xFFFF : (uint32_t)l;
+						thread_call_enter(gXeAuxBlTc);
+						static int nf = 0;
+						if (nf++ < 4) IOLog("XeNG AUXBL: PWM period 0x%x unusable, level from duty 0x%x / %s 0x%x -> 0x%x\n",
+											gBlHwFreq, val, blmax > 0 ? "ngreenblmax" : "Apple period", den, gXeAuxBlLevel);
+					}
+				}
 			}
 		}
 	}
@@ -3950,8 +4811,11 @@ static void xeFixEnsure() {
 }
 void Gen11::FastWriteRegister32(AppleIntel::AppleIntelBaseController *that, unsigned long param_1, uint32_t param_2)
 {
+ HpPipeWrite trace("FastWriteRegister32",param_1,param_2);
 	if (xeInertDrop(param_1)) return;
 	param_2 = xeFixFilterWrite(param_1, param_2);
+	if (hpLegacyGammaB(param_1)) param_2=0;
+    hpPll0Write(param_1,param_2);
 	if ((param_1 & 0xFFFFF) == 0x7019C) xeFixEnsure();
 	// V99D: Diagnose — log all FastWrite calls near display engine range on first boot
 	// to understand what addresses/values flow through this path.
@@ -4052,8 +4916,20 @@ void Gen11::raWriteRegister32b(void *that,void *param_1,unsigned long param_2, U
 
 void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 {
+ HpPipeWrite trace("raWriteRegister32",param_1,param_2);
 	if (xeInertDrop(param_1)) return;
 	param_2 = xeFixFilterWrite(param_1, param_2);
+	if (hpLegacyGammaB(param_1)) param_2=0;
+	const uintptr_t clockOwner=__sync_fetch_and_add(&hpHdmiClockOwner,0);
+    if(clockOwner && clockOwner==reinterpret_cast<uintptr_t>(current_thread())) {
+        const uint32_t reg=static_cast<uint32_t>(param_1 & 0xffffffu);
+        // Exact donor indexes its Combo PLL by DDI: B -> PLL1. Do not mask
+        // PLL0 (panel A), PLL4, or unrelated writes after this call returns.
+        if(reg==0x16428cu)param_2 &= 0x1fffffffu;
+        if(reg==0x164290u)param_2 &= 0x0003fffcu;
+    }
+
+    hpPll0Write(param_1,param_2);
 	if ((param_1 & 0xFFFFF) == 0x7019C) xeFixEnsure();
 	// V93: optional plane SURF zero-write guard.
 	// Disabled by default due black-screen regressions; enable only with -ngreenv93.
@@ -4544,9 +5420,46 @@ uint64_t Gen11::getOSInformation(AppleIntel::AppleIntelBaseController *that)
 		pinfo[1].connectors[2] = { 2, 2, 2, 0, ConnectorDummy, 0 };
 		pinfo[1].connectors[3] = { 3, 3, 3, 0, ConnectorDummy, 0 };
 
+        // HP-only, opt-in HDMI test. Linux i915 on this exact 8086:A7A1 / 103C:8B34
+        // machine maps the direct HDMI socket to DDI B / pipe B. Its VBT child
+        // device is HDMIB and Linux i915 maps its VBT DDC pin 2 to DDI B. That
+        // Linux VBT pin is NOT Apple's framebuffer busId: Apple's GMBUS mapping
+        // uses busId 5 for GMBUS_PIN_DPB / HDMIB (see ConnectorInfo above).
+        // Keep internal connector 0, pipe allocation, and pipeline counts
+        // untouched; vary only Apple busId from the failed v3 value 2 to 5.
+        if (NGreen::callback && NGreen::callback->getHPA7A1Profile() &&
+            checkKernelArgument("-ngreenhphdmi")) {
+            pinfo[1].connectors[1].index = 1;
+            pinfo[1].connectors[1].busId = hpNativeDdcEnabled() ? 2 : 5;
+            pinfo[1].connectors[1].pipe = 2;
+            pinfo[1].connectors[1].type = ConnectorHDMI;
+            pinfo[1].connectors[1].flags = 0x1 | 0x100;
+            if(hpNativeDdcEnabled()) {
+                // Native PortConfig: DDI B, DDC pin 2, TMDS, non-TC, HDMI,
+                // external hotplug/TMDS flags. Legacy aperture interpretations
+                // of the last word are not valid for this native record.
+                const auto native=HPHDMI::nativeHdmiB();
+                static_assert(sizeof(native)==sizeof(pinfo[1].connectors[1]),"Connector/PortConfig ABI");
+                memcpy(&pinfo[1].connectors[1],&native,sizeof(native));
+            }
+            const auto &c=pinfo[1].connectors[1];
+            uint32_t profile[] = {3,c.index,c.busId,c.pipe,c.pad,c.type,c.flags};
+            OSData *d = OSData::withBytes(profile, sizeof(profile));
+            if (d) { NGreen::callback->iGPU->setProperty("HPHDMIConnectorTrial", d); d->release(); }
+            NGreen::callback->iGPU->setProperty("HPHDMITrialBuild", "hp-hdmi-v32-pipe-b-legacy-gamma");
+            SYSLOG("ngreen", "HP HDMI: connector 1 GMBUS pin %u, native HDMI flags 0x%x; internal eDP preserved", pinfo[1].connectors[1].busId, pinfo[1].connectors[1].flags);
+        }
 		SYSLOG("ngreen", "getOSInformation: patched pinfo[1] for ADL-P (LVDS+HDMI, mobile)");
 	}
-	return FunctionCast(getOSInformation, callback->ogetOSInformation)(that);
+    const uint64_t result=FunctionCast(getOSInformation, callback->ogetOSInformation)(that);
+    if(NGreen::callback && NGreen::callback->getHPA7A1Profile() && checkKernelArgument("-ngreenhphdmisafe")) {
+        uint32_t regs[]={1,0x164280,0,0x46010,0,0x46014,0,0x64000,0,0x64100,0,0x51004,0,0x46000,0};
+        for(unsigned i=1;i+1<sizeof(regs)/sizeof(regs[0]);i+=2)
+            regs[i+1]=NGreen::callback->readReg32(regs[i]);
+        auto *snapshot=OSData::withBytes(regs,sizeof(regs));
+        if(snapshot){NGreen::callback->publishHPBootClock(snapshot);snapshot->release();}
+    }
+    return result;
 }
 
 int Gen11::handleLinkIntegrityCheck()
@@ -4599,7 +5512,7 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 		NGreen::callback->writeReg32(0x45440, 0x00000003); // ICL_PWR_WELL_CTL_AUX1 — AUX A
 		NGreen::callback->writeReg32(0x45444, 0x00000003); // ICL_PWR_WELL_CTL_AUX2 — AUX B
 		NGreen::callback->writeReg32(0x45450, 0x00000003); // ICL_PWR_WELL_CTL_DDI1 — DDI A
-		NGreen::callback->writeReg32(0x45454, 0x00000003); // ICL_PWR_WELL_CTL_DDI2 — DDI B
+		NGreen::callback->writeReg32(0x45454, hpHDMIDDIRequest()); // ICL_PWR_WELL_CTL_DDI2 — DDI B
 
 		// TGL display engine registers (DMC trigger/context regs in 0x8Fxxx range)
 		// Values from IDA of original hwInitializeCState (TGL-native values)
@@ -4687,7 +5600,7 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 		NGreen::callback->writeReg32(0x45444, 0x00000003); // ICL_PWR_WELL_CTL_AUX2 — AUX B enabled
 		// ICL_PWR_WELL_CTL_DDI1/2 (0x45450/45454): enable DDI power wells A+B
 		NGreen::callback->writeReg32(0x45450, 0x00000003); // ICL_PWR_WELL_CTL_DDI1 — DDI A enabled
-		NGreen::callback->writeReg32(0x45454, 0x00000003); // ICL_PWR_WELL_CTL_DDI2 — DDI B enabled
+		NGreen::callback->writeReg32(0x45454, hpHDMIDDIRequest()); // ICL_PWR_WELL_CTL_DDI2 — DDI B enabled
 
 		// ADL-P / RPL-P display engine registers — exact MMIO init pairs from v3 blob header
 		// (adlp_dmc_ver2_16.bin header @ 0x0210, MMIO[0..6], stepping='A' variant)
@@ -4879,6 +5792,25 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 	}
 
 	hwConfigureCustomAUX(that, true);
+
+    // HP power trial: the original Apple DMC initializer runs after the early
+    // request writes and may change them. Apply and observe the request LAST.
+    if (NGreen::callback->getHPA7A1Profile() && checkKernelArgument("-ngreenhphdmiio")) {
+        const uint32_t before = NGreen::callback->readReg32(0x45454);
+        if (before != 0xffffffffu) {
+            const uint32_t wanted = before | 0xau;
+            if (wanted != before) NGreen::callback->writeReg32(0x45454, wanted);
+            const uint32_t after = NGreen::callback->readReg32(0x45454);
+            uint32_t evidence[] = {1, before, wanted, after};
+            OSData *data = OSData::withBytes(evidence, sizeof(evidence));
+            if (data) { NGreen::callback->iGPU->setProperty("HPHDMIInitPower", data); data->release(); }
+            NGreen::callback->iGPU->setProperty("HPHDMIInitDDIBRequest", (after & 8) ? kOSBooleanTrue : kOSBooleanFalse);
+            NGreen::callback->iGPU->setProperty("HPHDMIInitDDIBPowered", (after & 4) ? kOSBooleanTrue : kOSBooleanFalse);
+            IOLog("HPHDMI init end: DDI control before=%08x wanted=%08x after=%08x\n", before, wanted, after);
+        } else {
+            NGreen::callback->iGPU->setProperty("HPHDMIInitPowerInaccessible", kOSBooleanTrue);
+        }
+    }
 	SYSLOG("ngreen", "hwInitCState: done");
 }
 
@@ -4895,13 +5827,18 @@ void NGreen::adlpDcExit(const char *caller) {
 	writeReg32(0x45504, 0);
 	// 2. Restore power wells (request enable on CTL1/2/3/4 + AUX A/B + DDI A/B).
 	writeReg32(0x45400, uefiCtl1 | 0x401u);  // PWR_WELL_CTL1
-	writeReg32(0x45404, 0x0C03u);             // PWR_WELL_CTL2
+	uint32_t retain=0;
+ if(hpPipeTraceArmed&&getHPA7A1Profile()){
+  auto current=readReg32(0x45404);
+  if(current!=0xffffffffu)retain=current&0x2008u;
+ }
+ writeReg32(0x45404,0x0c03u|retain); // Preserve external requests across DC exit.
 	writeReg32(0x45408, 0x40000000u);         // PWR_WELL_CTL3
 	writeReg32(0x4540C, 0x401u);              // PWR_WELL_CTL4
 	writeReg32(0x45440, 0x3u);               // ICL_PWR_WELL_CTL_AUX1 — AUX A
 	writeReg32(0x45444, 0x3u);               // ICL_PWR_WELL_CTL_AUX2 — AUX B
 	writeReg32(0x45450, 0x3u);               // ICL_PWR_WELL_CTL_DDI1 — DDI A
-	writeReg32(0x45454, 0x3u);               // ICL_PWR_WELL_CTL_DDI2 — DDI B
+	writeReg32(0x45454, hpHDMIDDIRequest());               // ICL_PWR_WELL_CTL_DDI2 — DDI B
 	// 3. Restore ADL-P display engine context registers (saved by DMC on DC entry).
 	writeReg32(0x8F074, 0x00086FC0u);
 	writeReg32(0x8F034, 0xC003B400u);
@@ -5240,7 +6177,9 @@ uint8_t Gen11::hwRegsNeedUpdate
 		NGreen::callback->adlpDcExit("hwRNU");
 
 	// param_3 is the pending CRTCParams built by SetupParams.
-	if (!NGreen::callback->isRealTGL && param_3) {
+	const bool preservePanel = !hpNativeDdcEnabled() ||
+        (param_1 && getMember<uint32_t>(param_1,0x1dc)==0);
+    if (!NGreen::callback->isRealTGL && param_3 && preservePanel) {
 		auto *params = param_3;
 
 		// V97P: clear bit[16] in TRANS_DDI_FUNC_CTL.
@@ -5299,7 +6238,23 @@ uint8_t Gen11::hwRegsNeedUpdate
 	// by the computeLaneCount hook forcing 4 lanes.  Without register updates, the
 	// plane surface address and stride never get written, leaving the stale BIOS
 	// framebuffer on screen (grey/black vertical bars with only cursor visible).
-	return FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);
+	const uint8_t nativeResult=FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);
+    if(!hpNativeDdcEnabled())return nativeResult;
+    const uint32_t fb=param_1?getMember<uint32_t>(param_1,0x1dc):0xffffffffu;
+    const uint32_t pipe=param_2?getMember<uint32_t>(param_2,0x3640):0xffffffffu;
+    void *port=param_2?getMember<void*>(param_2,0x3648):nullptr;
+    const uint32_t *info=port?getMember<const uint32_t*>(port,0x548):nullptr;
+    const uint32_t ddi=info?info[0]:0xffffffffu;
+
+    const bool admitted=(fb==0)||(hpPll0Trial&&hpPll0Active&&!hpPll0Fault);
+    const uint8_t decision=HPHDMI::modesetDecision(admitted,fb,ddi,pipe,
+        (fb==1&&ddi==1&&pipe==1)?NGreen::callback->readReg32(0x71008):0xffffffffu,nativeResult);
+    if(fb==1) {
+        const uint32_t state[]={1,fb,ddi,pipe,nativeResult,decision};
+        auto *data=OSData::withBytes(state,sizeof(state));
+        if(data){NGreen::callback->iGPU->setProperty("HPHDMIModesetDecision",data);data->release();}
+    }
+    return decision;
 }
 
 int Gen11::wrapHwSetupMemory(AppleIntel::AppleIntelBaseController *that, AppleIntel::AppleIntelFramebuffer *fb, AppleIntel::AppleIntelDisplayPath *displayPath, AppleIntel::CRTCParams *params, bool isAperture)
@@ -6404,6 +7359,37 @@ void Gen11::getGPUInfoICL(void *that)
 		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU);
 }
 
+// xe/hwcaps114c (#5, #3): IntelAccelerator::getGPUInfo (16.0.2, 0x2847e) derives NumSlices (0x115c) and NumSubSlices
+// (0x1158 = popcount(DSS fuse) * 2, at 0x28654) from the fuses and then calls initHardwareCaps (0x2a666, call at 0x288bb),
+// which derives from them, for SKU 2 (0x1120): 0x114c = SS >> 1 (DSS count), 0x1128 = 2 * DSS, 0x1144 = (6 - DSS) * 2,
+// 0x1140 = 0x80 * DSS, 0x1168 = slices << 4 (SKU 1: DSS = SS, factor 1, max 12, 0x40). Our override below rewrites
+// 0x1158/0x115c only after all that, so when the fuse read returned 0 (TGL-H 9A68 in #5; the real-TGL path has no
+// NumSubSlices patch) those fields stay 0. get_hw_caps then copies 0x1110..0x118b to the Metal driver, where 0x114c
+// is mHWCaps+0x3c, the divisor of generate3DStatePS (WindowServer SIGFPE). When 0x114c is 0 after our override we
+// run initHardwareCaps again on the overridden counts (the same code Apple runs, so the SKU constants stay its own).
+// With a non-zero 0x114c (the XPS: 6) nothing is touched.
+static void xeHwCapsFill(void *that) {
+	if (getMember<uint32_t>(that, 0x114c) != 0) return;
+	const uint32_t b1128 = getMember<uint32_t>(that, 0x1128), b1144 = getMember<uint32_t>(that, 0x1144),
+				   b1140 = getMember<uint32_t>(that, 0x1140), b1168 = getMember<uint32_t>(that, 0x1168);
+	bool ok = false;
+	if (gXeInitHwCaps) ok = reinterpret_cast<bool (*)(void *)>(gXeInitHwCaps)(that);
+	const uint32_t ss = getMember<uint32_t>(that, 0x1158);
+	if (getMember<uint32_t>(that, 0x114c) == 0) {   // SKU not 1/2, or symbol missing: SKU 2 formula on our count
+		const uint32_t dss = (ss >> 1) ? (ss >> 1) : 1;
+		getMember<uint32_t>(that, 0x114c) = dss;
+		getMember<uint32_t>(that, 0x1128) = 2 * dss;
+		getMember<uint32_t>(that, 0x1144) = dss < 6 ? (6 - dss) * 2 : 0;
+		getMember<uint32_t>(that, 0x1140) = 0x80 * dss;
+		getMember<uint32_t>(that, 0x1168) = getMember<uint32_t>(that, 0x115c) << 4;
+	}
+	IOLog("XeNG HWCAPS: 0x114c was 0 (sku %u ss %u): initHardwareCaps %s -> 0x114c=%u 0x1128=%u->%u 0x1144=%u->%u "
+		  "0x1140=0x%x->0x%x 0x1168=0x%x->0x%x\n", getMember<uint32_t>(that, 0x1120), ss,
+		  !gXeInitHwCaps ? "missing" : ok ? "ok" : "failed", getMember<uint32_t>(that, 0x114c),
+		  b1128, getMember<uint32_t>(that, 0x1128), b1144, getMember<uint32_t>(that, 0x1144),
+		  b1140, getMember<uint32_t>(that, 0x1140), b1168, getMember<uint32_t>(that, 0x1168));
+}
+
 void Gen11::getGPUInfo(void *that)
 {
 
@@ -6455,11 +7441,11 @@ void Gen11::getGPUInfo(void *that)
 		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU, gTopoL3);
 	IOLog("XeNG TOPO: subslices=%u eu/ss=%u eu=%u l3=%u%s\n", numSubSlices, maxEUPerSubSlice, totalEU, gTopoL3,
 	      (numSubSlices == 12 && gTopoL3 == 8) ? " (default)" : " (boot-arg)");
+	xeHwCapsFill(that);
 	// published later from a thread_call, not from inside getGPUInfo
-	static thread_call_t tc = nullptr;
 	gTopoAcc = that;
-	if (!tc) tc = thread_call_allocate(xeTopoPublish, nullptr);
-	if (tc) thread_call_enter(tc);
+	if (!gTopoTc) gTopoTc = thread_call_allocate(xeTopoPublish, nullptr);
+	if (gTopoTc) thread_call_enter(gTopoTc);
 
 }
 
@@ -6892,9 +7878,13 @@ void Gen11::wrapSetGTFrequencyMMIO(void *that, uint32_t val)
 {
 	static int pisoMhz = -1;
 	if (pisoMhz < 0) {
-		pisoMhz = 1500;
+        const bool hp = NGreen::callback && NGreen::callback->getHPA7A1Profile();
+		pisoMhz = hp ? HPA7A1::MaxFrequencyMHz : 1500;
 		PE_parse_boot_argn("ngreengtfreq", &pisoMhz, sizeof(pisoMhz));
-		if (pisoMhz > 1500) pisoMhz = 1500;
+        if (hp) {
+            pisoMhz = HPA7A1::frequencyFloor(pisoMhz);
+            NGreen::callback->iGPU->setProperty("xe-hp-frequency-floor-mhz", static_cast<uint32_t>(pisoMhz), 32);
+        } else if (pisoMhz > 1500) pisoMhz = 1500;
 	}
 	gXeGtFreqApple = val;
 	gXeGtFreqN++;
@@ -7211,6 +8201,24 @@ unsigned long Gen11::startGraphicsEngine(void *that)
 		SYSLOG("ngreen", "V163: startGraphicsEngine post-clear FF_SLICE_CS_CHICKEN1=0x%08x (ret=%lu)",
 			NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1), ret);
 		xeLrcaRepair("post-start");
+		// xe/rowchk (25/10, #9): Wa_1606931601 + Wa_1508744258 (i915 rcs_engine_wa_init, tgl/adl-p): GEN8_ROW_CHICKEN2
+		// (0xe4f4, masked) bits 14|15 = GEN12_DISABLE_EARLY_READ | GEN12_DISABLE_READ_SUPPRESSION. Upstream NootedGreen has
+		// them in dead code after a return and Apple only sets bits 0/1/8. Without them SIMD32 kernels read one stale GRF
+		// (lanes 8-15, .x channel): non-deterministic results in kernels with private arrays, the short dashes of Core Image's
+		// Lanczos (Preview/Photos zoom). Written after Apple's start, with the render well held awake through our own
+		// FORCEWAKE_RENDER requester bit (5) so Apple's references stay untouched; without forcewake the write is lost.
+		// Readback in ioreg xe-rowchk-* (post bit 31 = forcewake acked). -ngreennorowchk turns it off.
+		if (xeFixEnabled() && !checkKernelArgument("-ngreennorowchk")) {
+			auto *cb = NGreen::callback;
+			cb->writeReg32(FORCEWAKE_RENDER_GEN9, (1u << 21) | (1u << 5));
+			for (int i = 0; i < 500 && !(cb->readReg32(FORCEWAKE_ACK_RENDER_GEN9) & (1u << 5)); i++) IODelay(100);
+			gRc2Pre = cb->readReg32(GEN8_ROW_CHICKEN2);
+			cb->writeReg32(GEN8_ROW_CHICKEN2, (0xC000u << 16) | 0xC000u);
+			gRc2Post = cb->readReg32(GEN8_ROW_CHICKEN2) | (cb->readReg32(FORCEWAKE_ACK_RENDER_GEN9) & (1u << 5) ? 0x80000000u : 0);
+			cb->writeReg32(FORCEWAKE_RENDER_GEN9, (1u << 21));
+			gRc2N++;
+			if (gTopoTc) thread_call_enter(gTopoTc);
+		}
 	}
 
 	return ret;
@@ -8697,7 +9705,9 @@ uint32_t Gen11::wrapReadRegister32(void *controller, uint32_t address) {
 }
 
 void Gen11::wrapWriteRegister32(void *controller, uint32_t address, uint32_t value) {
+ HpPipeWrite trace("wrapWriteRegister32",address,value);
 	if (xeInertDrop(address)) return;
+	if (hpLegacyGammaB(address)) value=0;
 	if ((address & 0xFFFFF) == 0xC8254 || (address & 0xFFFFF) == 0xC8258) value = xeFixFilterWrite(address, value);  // 20/10: só o brilho (XE-BLR) neste caminho
 	if (controller == nullptr) {
 		NGreen::callback->writeReg32(address, value);
@@ -11754,33 +12764,16 @@ Gen11::IntelFBClientControldoAttribute
 }
 
 int hw=1;
+// Donor 94ba3c: hwSetMode takes detailed timing, not CRTCParams.
+// Keep this wrapper unregistered until the native HDMI resource contract is
+// implemented. It must not touch panel A when handling external framebuffer B.
 int Gen11::hwSetMode
-		  (AppleIntel::AppleIntelBaseController *that,
-		   AppleIntel::AppleIntelFramebuffer *param_1,
-		   AppleIntel::AppleIntelDisplayPath *param_2,
-		   AppleIntel::CRTCParams *param_3)
+ (AppleIntel::AppleIntelBaseController *that,
+  AppleIntel::AppleIntelFramebuffer *framebuffer,
+  AppleIntel::AppleIntelDisplayPath *path,
+  const IODetailedTimingInformationV2 *timing)
 {
-	// On RPL-P (spoofed TGL), setPortMode ran just before us and restored TRANS_DDI_FUNC_CTL_A
-	// to 0x8A000106 (4-lane eDP, matching UEFI DDI_BUF_CTL_A). paramsFbCompare inside the
-	// original hwSetMode reads TRANS_DDI_FUNC_CTL_A and compares it with the target 0x8A010102
-	// (2-lane DP SST). Write the correct value NOW so paramsFbCompare sees no lane-count change
-	// needed and leaves DDI_BUF_CTL_A alone — preserving the UEFI-trained 4-lane eDP link.
-	if (!NGreen::callback->isRealTGL) {
-		// XE-FWSNAP (audit c1): o valor treinado pelo firmware, não o literal de 4 faixas do upstream.
-		static int ddiArg = -1;
-		static uint32_t ddiOv = 0;
-		if (ddiArg < 0) { ddiArg = 0; if (PE_parse_boot_argn("ngreenddifunc", &ddiOv, sizeof(ddiOv)) && ddiOv) ddiArg = 1; }
-		xeFwSnapshot();
-		uint32_t v = ddiArg == 1 ? ddiOv : (gXeFwDdiFuncA ? gXeFwDdiFuncA : 0x8A000106u);
-		NGreen::callback->writeReg32(0x60400, v);
-		DBGLOG("ngreen", "hwSetMode: pre-write TRANS_DDI_FUNC_CTL_A=0x%x (%s) to prevent paramsFbCompare lane reprog",
-			   v, ddiArg == 1 ? "boot-arg" : (gXeFwDdiFuncA ? "firmware" : "fallback"));
-	}
-	auto ret= FunctionCast(hwSetMode, callback->ohwSetMode)(that, param_1, param_2, param_3);
-	if (hw)
-		enablePipe(that, param_1, param_2, param_3);
-	hw=0;
-	return ret;
+ return FunctionCast(hwSetMode, callback->ohwSetMode)(that, framebuffer, path, timing);
 }
 
 void Gen11::enablePipe
@@ -12235,4 +13228,16 @@ static bool xeBlitFixInstall(KernelPatcher &patcher, KernelPatcher::KextInfo *ke
 	memcpy(blk + 20, tail, sizeof(tail));
 	LookupPatchPlus const p[] = {{kext, v2, blk, sizeof(blk), 1}};
 	return LookupPatchPlus::applyAll(patcher, p, address, size);
+}
+
+IOReturn Gen11::hpCursorGetAttribute(AppleIntel::AppleIntelFramebuffer *that, uint32_t attribute, uintptr_t *value) {
+    auto result = FunctionCast(hpCursorGetAttribute, callback->oHPCursorGetAttribute)(that, attribute, value);
+    if (attribute == 0x63727372U && value && result == kIOReturnSuccess) { // 'crsr'
+        const uintptr_t original = *value;
+        *value = 0;
+        static uint32_t count = 0;
+        if (count++ < 8) SYSLOG("ngreen", "HP cursor: capability %lu -> 0; native software trial", (unsigned long)original);
+        NGreen::callback->iGPU->setProperty("xe-hp-swcursor-requested", true);
+    }
+    return result;
 }

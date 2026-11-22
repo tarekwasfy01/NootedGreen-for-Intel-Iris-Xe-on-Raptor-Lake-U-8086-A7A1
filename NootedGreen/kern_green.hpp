@@ -36,6 +36,7 @@ class EXPORT PRODUCT_NAME : public IOService {
 	OSDeclareDefaultStructors(PRODUCT_NAME);
 
 	public:
+
 	IOService *probe(IOService *provider, SInt32 *score) override;
 	bool start(IOService *provider) override;
 };*/
@@ -46,6 +47,28 @@ class NGreen {
 	friend class DYLDPatches;
 
     public:
+    void publishHPGammaB(OSData *data) { if(iGPU&&data)iGPU->setProperty("HPHDMIGammaB",data); }
+    void publishHPCompletion(OSData *data) { if(iGPU&&data)iGPU->setProperty("HPHDMINativeCompletion",data); }
+    void publishHPIndexedResult(uint32_t result) { if(iGPU)iGPU->setProperty("HPHDMIIndexedDdcResult",result,32); }
+    void publishHPDdcRecovery(OSData *data) { if(iGPU&&data)iGPU->setProperty("HPHDMIDdcRecovery",data); }
+    void publishHPWire(bool ready) { if(iGPU)iGPU->setProperty("HPHDMIRgb8Policy",ready?kOSBooleanTrue:kOSBooleanFalse); }
+    void publishHPWireRejected() { if(iGPU)iGPU->setProperty("HPHDMIRgb8Rejected",kOSBooleanTrue); }
+    void publishHPScanout(OSData *data) { if(iGPU&&data)iGPU->setProperty("HPHDMIScanoutAfterModeset",data); }
+    void publishHPRepeat(bool reuse) { if(iGPU)iGPU->setProperty("HPHDMIOwnedPllReuse",reuse?kOSBooleanTrue:kOSBooleanFalse); }
+    void publishHPPll0(bool ready,bool locked) { if(iGPU){iGPU->setProperty("HPHDMIPll0Hooks",ready?kOSBooleanTrue:kOSBooleanFalse);iGPU->setProperty("HPHDMIPll0Verified",locked?kOSBooleanTrue:kOSBooleanFalse);} }
+    void publishHPBootClock(OSData *data) { if(iGPU&&data)iGPU->setProperty("HPHDMIBootClockReadout",data); }
+    void publishHPClockAdmission(OSData *data) { if(iGPU&&data)iGPU->setProperty("HPHDMIClockAdmission",data); }
+    void publishHPSafeHook(bool ready) { if(iGPU)iGPU->setProperty("HPHDMISafeHook",ready?kOSBooleanTrue:kOSBooleanFalse); }
+    void publishHPSafeReject(uint32_t count) { if(iGPU)iGPU->setProperty("HPHDMISafeRejected",count,32); }
+    void publishHPScope(bool ready) { if(iGPU)iGPU->setProperty("HPHDMIClockScopeHook",ready?kOSBooleanTrue:kOSBooleanFalse); }
+    void publishHPFraction(bool applied,bool ready) { if(iGPU)iGPU->setProperty(applied?"HPHDMIHalfFractionApplied":"HPHDMIHalfFractionHook",ready?kOSBooleanTrue:kOSBooleanFalse); }
+    void publishHPGmbusCpuReady(bool ready) { if(iGPU)iGPU->setProperty("HPHDMIGmbusCPUFix",ready?kOSBooleanTrue:kOSBooleanFalse); }
+    void publishHPHDCHotplug(OSData *data) { if(iGPU && data)iGPU->setProperty("HPHDMIHotplugFallback",data); }
+    void publishHPHpdRoute(bool ready) { if(iGPU)iGPU->setProperty("HPHDMIHotplugRoute",ready?kOSBooleanTrue:kOSBooleanFalse); }
+    void publishHPDDCRecord(OSData *data) { if(iGPU && data) iGPU->setProperty("HPHDMINativeDDC",data); }
+    void publishHPDDCEdid(OSData *data) { if(iGPU && data) iGPU->setProperty("HPHDMILiveEDID",data); }
+    void publishHPDDCRoute(bool ready) { if(iGPU) iGPU->setProperty("HPHDMINativeDDCRoute",ready?kOSBooleanTrue:kOSBooleanFalse); }
+    void publishHPProbeRecord(OSData *data) { if (iGPU && data) iGPU->setProperty("HPHDMIProbeRejected", data); }
     static NGreen *callback;
     void init();
     void processPatcher(KernelPatcher &patcher);
@@ -283,6 +306,7 @@ class NGreen {
     bool isRealTGL = false;  // true if CPU is genuine TGL (model 0x8C/0x8D), false if spoofed (RPL/ADL)
 public:
     bool getIsRealTGL() const { return isRealTGL; }
+    bool getHPA7A1Profile() const { return hpA7A1Profile; }
     uint64_t mmioLength() const { return (rmmio && rmmioPtr) ? rmmio->getLength() : 0; }  // xe/rc6fw (22/10)
 private:
     bool dmcIsAdlp = false;    // true when ADL-P DMC blob was loaded in hwInitializeCState
@@ -292,6 +316,7 @@ private:
     uint32_t deviceId {0};
     uint16_t revision {0};
     uint32_t pciRevision {0};
+    bool hpA7A1Profile {false};
     IOPCIDevice *iGPU {nullptr};
 	
 	IOMemoryMap *rmmio {nullptr};
