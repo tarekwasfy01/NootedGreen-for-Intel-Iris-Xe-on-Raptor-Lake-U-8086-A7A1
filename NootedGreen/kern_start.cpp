@@ -21,7 +21,7 @@ PluginConfiguration ADDPR(config) {
 	nullptr,
 	0,
 	KernelVersion::Ventura,
-	KernelVersion::Sequoia,
+	KernelVersion::Tahoe,
 	[]() { nb.init(); },
 };
 

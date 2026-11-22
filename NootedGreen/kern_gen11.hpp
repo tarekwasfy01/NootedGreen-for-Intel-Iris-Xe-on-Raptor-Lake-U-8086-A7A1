@@ -1350,6 +1350,9 @@ private:
 	static uint8_t validateDisplayMode(void *that, int param_1, void *param_2, void *param_3);
 	mach_vm_address_t ovalidateDisplayMode{};
 
+	static uint32_t getCurrentDisplayMode(void *that, int *displayMode, int *depth);
+	mach_vm_address_t ogetCurrentDisplayMode{};
+
 	static void setupDisplayTiming(void *that, void *param_1, void *param_2);
 	mach_vm_address_t osetupDisplayTiming{};
 
@@ -1805,6 +1808,14 @@ private:
 	// ── 3D Blit engine (GPU-accelerated blitting via 3D pipeline) ──
 	static void IGHardwareBlit3DContextinitialize(void *that);
 	mach_vm_address_t oIGHardwareBlit3DContextinitialize {};
+	static void IGAccelResourcefree(void *that);
+	static IOReturn wrapSetFramebufferPowerState(void *that, unsigned int state);
+	mach_vm_address_t oSetFramebufferPowerState {};
+	mach_vm_address_t oIGAccelResourcefree {};
+	static void wrapSetGTFrequencyMMIO(void *that, uint32_t val);
+	static void wrapWaitForGpuIdle(void *that);
+	mach_vm_address_t oSetGTFrequencyMMIO {};
+	mach_vm_address_t oWaitForGpuIdle {};
 	
 	static bool  initHardwareCaps(void *this_ptr);  // query HW capabilities
 	mach_vm_address_t oinitHardwareCaps {};
@@ -1964,6 +1975,7 @@ private:
 	static unsigned long startGraphicsEngine(void *that);  // V163: clear PERCTX_PREEMPT_CTRL before first context snapshot
 	mach_vm_address_t ostartGraphicsEngine {};
 
+	static void xeLrcaRepair(const char *tag);
 	static void populateResetRegisterList(void *that);  // V164: clear bit 14 before snapshot into replay list
 	mach_vm_address_t opopulateResetRegisterList {};
 
@@ -2015,6 +2027,9 @@ private:
 	mach_vm_address_t oprepareToEnterWake {};
 	
 public:
+	// xe/fwsubmit: acesso público ao forcewake do NootedGreen (para ganchos livres)
+	static void xeForceWakePub(void *that, bool set, uint32_t dom, uint8_t ctx) { forceWake(that, set, dom, ctx); }
+
 
 	static volatile bool gGfxAccelStartDone;  // V221: set true after IntelAccelerator::start() returns
 	// Resolved from IOAcceleratorFamily2 by NGreen::processKext — needed by blit3d scratch init.

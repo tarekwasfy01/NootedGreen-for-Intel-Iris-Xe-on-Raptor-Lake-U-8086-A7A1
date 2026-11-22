@@ -1,6 +1,7 @@
 //  Copyright © 2026 Stezza @ inc. Licensed under the Thou Shalt Not Profit License version 1.0. See LICENSE for
 //  details.
 #include "kern_gen11.hpp"
+static bool xeFixEnabled();  // xe/xefix, definido junto do FastWriteRegister32
 #include "AppleIntelParams.hpp"
 #include <Headers/kern_api.hpp>
 #include "kern_genx.hpp"
@@ -10,6 +11,64 @@
 #include <IOKit/IOCatalogue.h>
 #include <IOKit/IOLib.h>
 #include <kern/thread_call.h>
+// xe/blitscratch2: definidos em kern_green.cpp (wrapLockCpu)
+extern void *volatile gXeBlitMem, *volatile gXeBlitCpu;
+static volatile uint32_t gXeGtFreqApple = 0, gXeGtFreqN = 0;  // XE-GTFREQ: último pedido da Apple, nº de pedidos
+static volatile uint32_t gXeDpmsBlocked = 0;  // XE-NODPMS: escritas de desligamento do caminho de vídeo bloqueadas
+static volatile uint32_t gXeFbDpmsN = 0;  // XE-FBDPMS: transições de repouso interceptadas
+static volatile uint32_t gXeResFreeFix = 0;  // XE-RESFREE: entradas inválidas neutralizadas
+extern volatile uint32_t gXeOrphanMiss;  // XE-NOORPHAN (kern_green.cpp)
+extern bool gXeLockRouted;
+
+// ─── XE-FWSNAP (X1C, 25/10): registradores treinados pelo firmware, lidos UMA vez antes de qualquer escrita ──────
+// Dois valores do upstream eram literais do painel do autor (2560x1600, 4 faixas) e do XPS, e quebram outro painel:
+//   kern_gen11.cpp:hwSetMode gravava TRANS_DDI_FUNC_CTL_A = 0x8A000106 (DDI-A, DP SST, 8bpc, 4 FAIXAS) em todo
+//   modeset; o X1 Carbon Gen 11 treina o eDP com 2 faixas (valor vivo 0x8a010002, hw/linux/intel_reg.txt). Gravar
+//   4 faixas num transcoder ligado reinicia o buffer DDI e derruba o link (o próprio upstream avisa disso em
+//   hwInitializeCState). E adlpDcExit gravava PP_CONTROL = 0x67 em toda saída de DC, apagando o bit 3
+//   (EDP_BLC_ENABLE) que o firmware deste aparelho liga (valor vivo 0x6f) — 1122 transições DC5->DC6 em minutos.
+// Agora os dois valores vêm do hardware. No XPS a captura devolve exatamente os literais antigos, então o
+// comportamento lá não muda. Override: ngreenddifunc=0xVALOR. Veja docs/X1C-G11-PORT.md (c1, c4).
+static uint32_t gXeFwDdiFuncA = 0;   // TRANS_DDI_FUNC_CTL_A (0x60400)
+static uint32_t gXeFwPpControl = 0;  // PP_CONTROL          (0xC7204)
+static void xeFwSnapshot() {
+	if (!NGreen::callback || NGreen::callback->getIsRealTGL()) return;  // acessor público (kern_green.hpp:285)
+	if (!gXeFwDdiFuncA) {
+		uint32_t v = NGreen::callback->readReg32(0x60400);
+		if (v & 0x80000000u) {   // só aceita um transcoder já ligado pelo firmware
+			gXeFwDdiFuncA = v;
+			SYSLOG("ngreen", "XE-FWSNAP: TRANS_DDI_FUNC_CTL_A=0x%x (faixas=%u, porta=%u)", v,
+				   ((v >> 1) & 0x7u) + 1, ((v >> 27) & 0xfu));
+		}
+	}
+	if (!gXeFwPpControl) {
+		uint32_t v = NGreen::callback->readReg32(0xC7204);
+		if (v) {
+			gXeFwPpControl = v;
+			SYSLOG("ngreen", "XE-FWSNAP: PP_CONTROL=0x%x (BLC_ENABLE=%u)", v, (v >> 3) & 1u);
+		}
+	}
+}
+
+// ─── xe/topo4/5 (24/10): topologia escolhida por boot-arg, sem ler fusíveis ──────────────────────────────────────
+// topo/topo2/topo3 liam os fusíveis no boot e todos travaram o boot (23/10), mesmo calculando 96 EU aqui. Agora o
+// layout só muda com ngreen-eu=80 (ou 64/48) e, opcional, ngreen-l3=N. Sem os args: 12 SS × 8 EU, L3 8, como antes.
+// Dados de 80 EU (Linux, issue #3): i5-1340P = 5 DSS × 16 EU (máscara 0x1f, DSS0 presente) -> 10 SS × 8 EU.
+// O steering MCR continua no DSS0 (presente nos chips de 80 EU vistos). ioreg: xe-topo = eu<<8 | l3 (no acelerador).
+static uint32_t gTopoSs = 12, gTopoL3 = 8;
+static bool gTopoParsed = false;
+static void xeTopoArgs() {
+	if (gTopoParsed) return;
+	gTopoParsed = true;
+	uint32_t eu = 0, l3 = 0;
+	if (PE_parse_boot_argn("ngreen-eu", &eu, sizeof(eu)) && (eu == 48 || eu == 64 || eu == 80 || eu == 96)) gTopoSs = eu / 8;
+	if (PE_parse_boot_argn("ngreen-l3", &l3, sizeof(l3)) && l3 >= 2 && l3 <= 16 && !(l3 & 1)) gTopoL3 = l3;
+}
+static void *volatile gTopoAcc = nullptr;
+static void xeTopoPublish(thread_call_param_t, thread_call_param_t) {
+	auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gTopoAcc));
+	if (svc) svc->setProperty("xe-topo", (gTopoSs * 8) << 8 | gTopoL3, 32);
+}
 
 // ==== 6 kextInfos: ICL fallback + dual TGL identities (com.xxxxx and com.apple) from /Library/Extensions ====
 //trivial
@@ -58,6 +117,13 @@ static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraph
 // No separate kextIOAF2 registration needed here.
 
 Gen11 *Gen11::callback = nullptr;
+
+// xe/bootmode: contadores do hook getCurrentDisplayMode, impressos junto do HANGCHECK (os SYSLOGs do load do kext
+// são sobrescritos no msgbuf pelo log do IGFB antes de o logd drenar).
+static volatile uint32_t gFbModeCalls = 0, gFbModeBootProg = 0, gFbModeSubst = 0, gFbModeLastRet = 0, gFbModeLastMode = 0;
+static volatile uint32_t gFbModeArgSeen = 0;
+static volatile uint32_t gTglFbBlockRuns = 0, gTglFbRoutesDone = 0, gIcLFbBlockRuns = 0;
+static volatile uint64_t gOrgGcdm = 0, gOrgGpi = 0, gOrgVdm = 0;
 
 void Gen11::init() {
 	callback = this;
@@ -278,8 +344,733 @@ static int getV77KillDelayIterations() {
 	return 60;
 }
 
+// xe/bootmode (-ngreenfixbootmode): o FB TGL nasce com fCurrentMode = kIOFBBootProgrammable (0xfffffffb, sem detailed
+// timings), e o IOAccelDisplayPipe::init_framebuffer_resource pede o pixel info desse "modo" antes de o WindowServer
+// definir qualquer coisa. getPixelInformation falha (0xe00002c2), o CoreDisplay marca a tela principal como offline e o
+// WindowServer aborta em loop. As rotas do Lilu para getCurrentDisplayMode/getPixelInformation foram instaladas mas não
+// são chamadas, então corrige-se na origem: o imediato de "movl $0xfffffffb, 0x4250(%rbx)" (fCurrentMode, offset
+// 0x53de3 em 16.0.32) passa a ser 0x80001000, o modo nativo 3840x2400 que a EFI deixa programado (-ngreenkeepefi).
+static volatile uint32_t gFbModePatchTried = 0, gFbModePatchOk = 0;
+static void applyFixBootMode(KernelPatcher &patcher, KernelPatcher::KextInfo *kext, mach_vm_address_t address, size_t size) {
+	if (!checkKernelArgument("-ngreenfixbootpatch")) return;
+	static const uint8_t fbm[] = {0xc7, 0x83, 0x50, 0x42, 0x00, 0x00, 0xfb, 0xff, 0xff, 0xff};
+	static const uint8_t rbm[] = {0xc7, 0x83, 0x50, 0x42, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80};
+	LookupPatchPlus const bm[] = {{kext, fbm, rbm, arrsize(fbm), 1}};
+	gFbModePatchTried = 1;
+	gFbModePatchOk = LookupPatchPlus::applyAll(patcher, bm, address, size) ? 1 : 0;
+	SYSLOG("ngreen", "fixbootmode: fCurrentMode initial 0xfffffffb -> 0x80001000 patch %s", gFbModePatchOk ? "applied" : "NOT found");
+}
+
+// xe/bootmode (-ngreenfixbootmode): o WindowServer abre o display pipe (IOAccelDisplayPipe::init_framebuffer_resource)
+// ~2 s antes de o FB receber a tabela de timings (fDetailedTimings, this+0x4260, setDetailedTimings). Sem a tabela
+// validateDisplayMode devolve 0xe00002c2 e o DisplayPipe não é criado. Aqui montamos a tabela cedo, com o timing que a
+// própria EFI deixou programado no CRTC (hwCRTCToIODetailedTimingInformation), e fazemos o que setDetailedTimings faz:
+// setProperty("IOFBDetailedTimings") + guardar o ponteiro. O setDetailedTimings real, quando vier, substitui a nossa.
+// xe/flipdiag (19/10): o WindowServer para de fazer flips e cai por "Display not ready": o trabalho do stamp 1 fica
+// retido esperando algo (provavelmente a conclusão da transação de display). Contadores no caminho de conclusão
+// (TGL: submit/isComplete/signalComplete/signalDisplayStampUpdate), com IOLog nas primeiras chamadas e a cada 64.
+static void xeEv(uint32_t tag, uint32_t a, uint32_t b, uint32_t c);
+// xe/rc6fw (22/10): state shared by forceWake, xeSafeForceWake, the idle watchdog and the route code
+static IOSimpleLock *gFwLock = nullptr;     // forceWake's FWREF lock (was a static local in forceWake)
+static uint32_t gFwRef[8][4];               // forceWake's per-(domain, ctx) reference counts
+static mach_vm_address_t gOrgSafeForceWake = 0;
+static mach_vm_address_t gFwSymAddr = 0;    // runtime address of Apple's SafeForceWake(bool, uint)
+static int gRc6FwOn = 0;                    // 1 = route installed and active
+static int gRc6FwDrop = 1;                  // 0 = -ngreenrc6fwnodrop
+static uint32_t gRc6IdleMs = 500;
+static void *gFwAccel = nullptr;
+static thread_call_t gFwIdleTc = nullptr;
+static volatile uint32_t gFwActSeq = 0;     // bumped by every SafeForceWake call (multi path)
+static volatile uint32_t gFwUnderflow = 0;  // puts at count 0 (ignored) + negative counts repaired
+static volatile uint32_t gFwLeakDrops = 0;  // times the watchdog released a leaked hold
+static volatile uint32_t gFwLeakDom = 0;    // OR of the domains released
+static volatile uint64_t gFwLastGetCaller[3] = {};  // file offset of the last 0->1 get, per domain
+static volatile uint64_t gFwLeakCaller = 0;         // file offset of the get that leaked (last drop)
+static volatile uint64_t gFwUnderflowCaller = 0;    // file offset of the last ignored put
+
+static void xeSafeForceWake(void *that, bool set, uint32_t dom);
+static void xeRc6FwStart(void *accel);
+static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);  // xe/gpurec (22/10)
+static bool xeBlitFixInstall(KernelPatcher &patcher, KernelPatcher::KextInfo *kext, mach_vm_address_t address, size_t size, const uint8_t *v2, size_t v2Size);  // xe/blitfix (23/10)
+static uint8_t *volatile gAccelObj = nullptr;  // xe/csstate: IntelAccelerator (capturado em signalDisplayStampUpdate)
+static mach_vm_address_t gOrgDpSubmit = 0, gOrgDpIsComplete = 0, gOrgDpSignal = 0, gOrgDispStamp = 0;
+static volatile uint32_t gDpSubmitN = 0, gDpIsCompN = 0, gDpIsCompTrue = 0, gDpSignalN = 0, gDispStampN = 0;
+static uint64_t xeDpSubmit(void *that, void *t) {
+	uint32_t n = ++gDpSubmitN;
+	xeEv('FSUB', n, gDpIsCompTrue, gDpSignalN);
+	return FunctionCast(xeDpSubmit, gOrgDpSubmit)(that, t);
+}
+static bool xeDpIsComplete(void *that, void *t) {
+	bool r = FunctionCast(xeDpIsComplete, gOrgDpIsComplete)(that, t);
+	uint32_t n = ++gDpIsCompN;
+	if (r) gDpIsCompTrue++;
+	if (n <= 400) xeEv('FISC', n, r, gDpIsCompTrue);
+	return r;
+}
+static void xeDpSignal(void *that, void *ev) {
+	uint32_t n = ++gDpSignalN;
+	xeEv('FSIG', n, 0, 0);
+	FunctionCast(xeDpSignal, gOrgDpSignal)(that, ev);
+}
+static void xeDispStamp(void *that, int idx, uint32_t stamp) {
+	gAccelObj = static_cast<uint8_t *>(that);
+	uint32_t n = ++gDispStampN;
+	xeEv('FDST', n, (uint32_t)idx, stamp);
+	FunctionCast(xeDispStamp, gOrgDispStamp)(that, idx, stamp);
+}
+
+// xe/scheddiag (19/10): o trabalho do stamp 56 (índice 1) nunca chega à GPU. Contadores no escalonador 5:
+// push (entrada na fila), notify, submitExecList (escrita no hardware), pause/resume.
+static mach_vm_address_t gOrgS5Push = 0, gOrgS5Notify = 0, gOrgCs5Submit = 0, gOrgS5Pause = 0, gOrgS5Resume = 0;
+static volatile uint32_t gS5PushN = 0, gS5NotifyN = 0, gCs5SubmitN = 0, gS5PauseN = 0, gS5ResumeN = 0;
+static uint32_t gThrtN = 0, gThrtSimN = 0;
+static volatile uint32_t gCsbResyncN = 0;  // 21/10: active->idle salvos pelo xeCsbResync (CSBR)
+static volatile uint32_t gCsbSkipN = 0;  // 19/10: eventos active->idle descartados pelo xeCsbA2I
+// 20/10: brilho (PWM sul 0xC8254 período / 0xC8258 duty), estilo BacklightRegistersFix do WhateverGreen
+static volatile uint32_t gBlHwFreq = 0, gBlAppleFreq = 0, gBlLastDuty = 0, gBlMaxDuty = 0, gBlLastOut = 0, gBlFreqWrites = 0;
+static volatile uint32_t gIdlwN = 0, gIdlwMax = 0, gIdlwTimeout = 0;  // 19/10: esperas do IDLW (medir travadas)
+static volatile uint64_t gIdlwUs = 0;
+static volatile uint32_t gPageoffN = 0, gPageonN = 0;  // 19/10: chamadas de pageoff/pageon ignoradas (XE-NOPAGE)
+static volatile uint32_t gPageonFix = 0;
+static volatile uint32_t gSameTailForced = 0;  // 20/10: reenvios com tail igual forçados a restore completo  // 19/10: níveis com lista de retângulos não mapeada (PAGEONGUARD)  // 19/10: chamadas a verifyThrottling / quantas pediram throttle
+static void xeRetryWorker(thread_call_param_t, thread_call_param_t);
+static thread_call_t gRetryTc = nullptr;
+static uint64_t xeS5Push(void *that, void *ctx, uint32_t a, uint32_t b, bool c, bool d) {
+	if (!gRetryTc) gRetryTc = thread_call_allocate(xeRetryWorker, nullptr);
+	uint32_t n = ++gS5PushN;
+	uint64_t r = FunctionCast(xeS5Push, gOrgS5Push)(that, ctx, a, b, c, d);
+	xeEv('PUSH', n, a, b);
+	return r;
+}
+static uint64_t xeS5Notify(void *that, int cs) {
+	++gS5NotifyN;
+	return FunctionCast(xeS5Notify, gOrgS5Notify)(that, cs);
+}
+// xe/csstate (19/10): estado interno dos command streamers 5 e do DPSM, a cada 2 s (thread_call), para ver por que
+// o escalonador deixa de submeter: porta da execlist ocupada (0x30/0x38 por porta, 16 B), flags 0x1c00/0x1c38/0x1c3c,
+// e o bit "ocioso" do DPSM (IntelAccelerator+0x1458 bit 0; o kick só limpa se 0x1191 bit 2).
+static uint8_t *volatile gCs5Obj[4];
+static thread_call_t gCsStateTc = nullptr;
+struct XeCsbEnt;
+static void xeCsbFlush();
+static void xeEvFlush();
+static void xeEvDumpRecent(uint32_t count, int seq);
+static void xeCsStateWorker(thread_call_param_t, thread_call_param_t) {
+	static uint32_t tick = 0;
+	tick++;
+	// 19/10: a impressão contínua (milhares de linhas/s) apagava o dmesg (log do itlwm sumia) e gastava CPU.
+	// Com a GPU estável, só imprime com -ngreenevlog (os eventos continuam sendo gravados no anel).
+	static int evLog = -1;
+	if (evLog < 0) evLog = checkKernelArgument("-ngreenevlog") ? 1 : 0;
+	if (evLog == 1) {
+		xeCsbFlush();  // CSB primeiro
+		xeEvFlush();
+	}
+	// 20/10: quando o guard do CSB descarta um evento, imprime os ~120 eventos anteriores (até 6 vezes por boot),
+	// para achar por que o hardware e o escalonador discordam da execlist (raiz do "EL[0] was invalidated").
+	{
+		static uint32_t lastSkip = 0;
+		static int dumps = 0;
+		uint32_t sk = gCsbSkipN;
+		if (sk != lastSkip && dumps < 6) { lastSkip = sk; dumps++; xeEvDumpRecent(120, dumps); }
+	}
+	if (tick % 8 == 0) for (int i = 0; i < 4; i++) {
+		uint8_t *c = gCs5Obj[i];
+		if (!c) continue;
+		uint32_t cur = *reinterpret_cast<volatile uint32_t *>(c + 0x50);
+		IOLog("XeNG CS t=%u cs%d cur=%u p0=%d/%d p1=%d/%d f1c00=%u f1c38=%u f1c3c=%u\n", tick, i, cur,
+			  *reinterpret_cast<void *volatile *>(c + 0x30) != nullptr, *reinterpret_cast<void *volatile *>(c + 0x38) != nullptr,
+			  *reinterpret_cast<void *volatile *>(c + 0x40) != nullptr, *reinterpret_cast<void *volatile *>(c + 0x48) != nullptr,
+			  c[0x1c00], *reinterpret_cast<volatile uint32_t *>(c + 0x1c38), c[0x1c3c]);
+	}
+	if (gAccelObj && tick % 8 == 0)
+		IOLog("XeNG CS t=%u dpsm1458=0x%x cfg1190=0x%x (push %u exec %u) thrt=%u thrtSim=%u csbx=%u csbr=%u idlw=%u/%llums max=%uus to=%u pgoff=%u pgon=%u pgfix=%u stail=%u resfix=%u orf=%u dpms=%u fbdpms=%u gtf=%u/0x%x bl hw=%u apple=%u fw=%u duty=%u max=%u out=%u rc1474=%u\n", tick, *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1458),
+			  *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1190), gS5PushN, gCs5SubmitN, gThrtN, gThrtSimN, gCsbSkipN, gCsbResyncN, gIdlwN, (unsigned long long)(gIdlwUs / 1000), gIdlwMax, gIdlwTimeout, gPageoffN, gPageonN, gPageonFix, gSameTailForced, gXeResFreeFix, gXeOrphanMiss, gXeDpmsBlocked, gXeFbDpmsN, gXeGtFreqN, gXeGtFreqApple, gBlHwFreq, gBlAppleFreq, gBlFreqWrites, gBlLastDuty, gBlMaxDuty, gBlLastOut,
+			  (unsigned)*reinterpret_cast<volatile uint8_t *>(gAccelObj + 0x1474));
+	if (tick < 2400 && gCsStateTc) {  // a cada 250 ms por ~10 min
+		uint64_t deadline;
+		clock_interval_to_deadline(250, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gCsStateTc, deadline);
+	}
+}
+static void xeEv(uint32_t tag, uint32_t a, uint32_t b, uint32_t c);
+// xe/elsqretry (19/10): o RPL recusa a escrita na ELSQ do RCS quando o status está com troca de elemento pendente
+// (0x14198/0x18098: as duas execlists válidas, arbitragem ligada) -> fica o bit 30 e a submissão some.
+// Detecta (bit 30 depois da escrita), guarda os descritores e, numa thread, espera o motor ficar ocioso e repete o
+// EL_CTRL_LOAD (EXECLIST_CONTROL 0x2550 = 1) se a ELSQ ainda tiver os mesmos descritores. -ngreennoelsqretry desliga.
+static volatile uint32_t gRetryPend = 0, gRetrySeq = 0;
+static uint32_t gRetryQ[4];
+static void *gRetryAcc = nullptr;
+static void xeRetryWorker(thread_call_param_t, thread_call_param_t) {
+	auto *cb = NGreen::callback;
+	if (!cb || !gRetryPend) return;
+	if (gRetryAcc) Gen11::xeForceWakePub(gRetryAcc, true, 0b101, 3);
+	uint32_t st = 0, us = 0, resultado = 0;
+	for (; us < 200000; us += 50) {
+		st = cb->readReg32(0x2234);
+		if (!(st & 0x40000000)) { resultado = 1; break; }  // o hardware aceitou sozinho
+		if (cb->readReg32(0x2510) != gRetryQ[0] || cb->readReg32(0x2514) != gRetryQ[1]) { resultado = 2; break; }  // driver escreveu outra
+		if ((st & 0xff) == 0x01 || !(st & 0x18)) {  // ocioso: repete a carga
+			cb->writeReg32(0x2550, 1);
+			IODelay(20);
+			resultado = 3; st = cb->readReg32(0x2234);
+			break;
+		}
+		IODelay(50);
+	}
+	if (gRetryAcc) Gen11::xeForceWakePub(gRetryAcc, false, 0b101, 3);
+	xeEv('RTRY', resultado, st, us);
+	gRetryPend = 0;
+}
+// xe/sametail (20/10, do WhateverXe efa9241): o Linux evita "lite restore" com TAIL igual (o hardware se comporta mal).
+// Se o RCS reenvia o item ativo com contexto/descritor/imagem/tail idênticos aos da submissão anterior, liga o flag
+// one-shot de restauração forçada do contexto da Apple (ctx+0xc9; o código em 0x3a7b6 o converte em FORCE_RESTORE no
+// descritor). Layout conferido com o mesmo driver 16.0.32. -ngreennosametail desliga.
+struct XeSameTailEnt { uint64_t item, ctx, desc, image; uint32_t tail; };
+static XeSameTailEnt gSameTailPrev = {};
+static inline bool xeKptr(uint64_t p) { return (p >> 47) == 0x1ffff; }
+static void xeSameTail(void *that) {
+	static int on = -1;
+	if (on < 0) on = checkKernelArgument("-ngreennosametail") ? 0 : 1;
+	if (on != 1 || !that) return;
+	auto *st = static_cast<uint8_t *>(that);
+	auto *desc = *reinterpret_cast<uint8_t **>(st + 0x28);
+	if (!xeKptr((uint64_t)desc) || desc[0] != 0) return;  // só o RCS
+	uint32_t bank = *reinterpret_cast<uint32_t *>(st + 0x50);
+	if (bank >= 2) { gSameTailPrev = {}; return; }
+	uint64_t active = *reinterpret_cast<uint64_t *>(st + 0x30 + bank * 16);
+	uint64_t next = *reinterpret_cast<uint64_t *>(st + 0x30 + (1 - bank) * 16);
+	XeSameTailEnt e = {};
+	e.item = next;
+	if (!xeKptr(next)) { gSameTailPrev = {}; return; }
+	e.ctx = *reinterpret_cast<uint64_t *>(next);
+	if (!xeKptr(e.ctx) || *reinterpret_cast<uint8_t *>(e.ctx + 0x6c) != 0) { gSameTailPrev = {}; return; }
+	memcpy(&e.desc, reinterpret_cast<void *>(e.ctx + 0x89), 8);
+	uint64_t buf = *reinterpret_cast<uint64_t *>(e.ctx + 0x98);
+	if (!(e.desc & 1) || !xeKptr(buf) || *reinterpret_cast<uint64_t *>(buf + 0x20) != 81920) { gSameTailPrev = {}; return; }
+	e.image = *reinterpret_cast<uint64_t *>(buf + 0x38);
+	if (!xeKptr(e.image)) { gSameTailPrev = {}; return; }
+	e.tail = *reinterpret_cast<uint32_t *>(e.image + 0x101c);
+	if (active == next && !memcmp(&e, &gSameTailPrev, sizeof(e))) {
+		auto *forced = reinterpret_cast<volatile uint8_t *>(e.ctx + 0xc9);
+		if (!*forced) { *forced = 1; gSameTailForced++; }
+	}
+	gSameTailPrev = e;
+}
+static uint64_t xeCs5Submit(void *that, uint32_t x) {
+	for (int i = 0; i < 4; i++) {
+		if (gCs5Obj[i] == that) break;
+		if (!gCs5Obj[i]) { gCs5Obj[i] = static_cast<uint8_t *>(that); break; }
+	}
+	if (!gCsStateTc) {
+		gCsStateTc = thread_call_allocate(xeCsStateWorker, nullptr);
+		if (gCsStateTc) thread_call_enter(gCsStateTc);
+	}
+	uint32_t n = ++gCs5SubmitN;
+	xeEv('EXEC', n, x, gS5PushN);
+	xeSameTail(that);
+	uint64_t r = FunctionCast(xeCs5Submit, gOrgCs5Submit)(that, x);
+	// xe/elsq (19/10): o que foi escrito na fila de submissão. Base do motor pelo tipo do CS (cs+0x28 -> byte 0: 0=RCS)
+	auto *c28 = *reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(that) + 0x28);
+	uint32_t eb = (c28 && c28[0] != 0) ? 0x22000 : 0x2000;
+	if (NGreen::callback) {
+		auto rr = [&](uint32_t o) { return NGreen::callback->readReg32(eb + o); };
+		uint32_t tag = eb == 0x2000 ? 'ELR0' : 'ELB0';
+		xeEv(tag, rr(0x510), rr(0x514), rr(0x518));
+		xeEv(tag + 1, rr(0x51c), rr(0x550), rr(0x234));
+		xeEv(tag + 2, rr(0x238), rr(0x3a0), rr(0x034) | (rr(0x030) << 16));
+		static int retryArg = -1;
+		// 19/10: desligado por padrão (suspeito do pânico "EL[0] was invalidated!!": recarregar 0x2550 com a lista já
+		// aceita invalida o elemento 0); -ngreenelsqretry religa
+		if (retryArg < 0) retryArg = checkKernelArgument("-ngreenelsqretry") ? 1 : 0;
+		if (retryArg == 1 && eb == 0x2000 && (rr(0x234) & 0x40000000) && gRetryTc && !gRetryPend) {
+			gRetryQ[0] = rr(0x510); gRetryQ[1] = rr(0x514); gRetryQ[2] = rr(0x518); gRetryQ[3] = rr(0x51c);
+			gRetryAcc = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + 0x10);
+			gRetryPend = 1;
+			xeEv('RQUE', gRetryQ[0], gRetryQ[1], ++gRetrySeq);
+			thread_call_enter(gRetryTc);
+		}
+	}
+	return r;
+}
+static uint64_t xeS5Pause(void *that) {
+	uint32_t n = ++gS5PauseN;
+	if (n <= 40) IOLog("XeNG SCHED pause #%u (resume %u)\n", n, gS5ResumeN);
+	return FunctionCast(xeS5Pause, gOrgS5Pause)(that);
+}
+static uint64_t xeS5Resume(void *that) {
+	uint32_t n = ++gS5ResumeN;
+	if (n <= 40) IOLog("XeNG SCHED resume #%u (pause %u)\n", n, gS5PauseN);
+	return FunctionCast(xeS5Resume, gOrgS5Resume)(that);
+}
+
+// xe/ringdiag (19/10): por índice de stamp, cada submitToRing (anel -> hardware) e o último writeStamp emitido.
+static mach_vm_address_t gOrgRbSubmit = 0, gOrgRbWriteStamp = 0, gOrgRbSemPoll = 0;
+static volatile uint32_t gRbCount[64], gRbLastStamp[64];
+static uint64_t xeRbWriteStamp(void *that, uint32_t stamp, bool b) {
+	int idx = *reinterpret_cast<int *>(static_cast<uint8_t *>(that) + 0x38);
+	if (idx >= 0 && idx < 64) gRbLastStamp[idx] = stamp;
+	return FunctionCast(xeRbWriteStamp, gOrgRbWriteStamp)(that, stamp, b);
+}
+static uint64_t xeRbSubmit(void *that) {
+	auto *p = static_cast<uint8_t *>(that);
+	int idx = *reinterpret_cast<int *>(p + 0x38);
+	uint32_t tail = *reinterpret_cast<uint32_t *>(p + 0x64);
+	uint32_t c = (idx >= 0 && idx < 64) ? ++gRbCount[idx] : 0;
+	uint64_t r = FunctionCast(xeRbSubmit, gOrgRbSubmit)(that);
+	xeEv('RING', (uint32_t)idx, c, tail);
+	return r;
+}
+static uint64_t xeRbSemPoll(void *that, uint32_t value, int widx) {
+	int idx = *reinterpret_cast<int *>(static_cast<uint8_t *>(that) + 0x38);
+	uint64_t r = FunctionCast(xeRbSemPoll, gOrgRbSemPoll)(that, value, widx);
+	static volatile uint32_t n = 0;
+	if (++n <= 60) xeEv('SEMW', (uint32_t)idx, (uint32_t)widx, value);
+	return r;
+}
+
+// xe/csbdiag (19/10): cada entrada do CSB processada pelo escalonador 5: palavras brutas (lo/hi), o tipo que o driver
+// deduz (saída de processCSBDetail) e o estado das portas da execlist antes do tratador.
+static mach_vm_address_t gOrgCsbDetail = 0;
+#define XE_CSB_MAX 4096
+struct XeCsbEnt { uint32_t cs, idx, lo, hi, tipo, cur, portas; uint64_t t; };
+static XeCsbEnt gCsbLog[XE_CSB_MAX];
+static uint32_t gCsbN = 0, gCsbPrinted = 0;
+static uint64_t xeCsbDetail(void *that, uint32_t *out, uint32_t *idxp) {
+	auto *cs = static_cast<uint8_t *>(that);
+	uint32_t idx = idxp ? *idxp : 0xff, lo = 0, hi = 0;
+	auto *acc = *reinterpret_cast<uint8_t **>(cs + 0x10);
+	if (acc && idx < 6) {
+		uint8_t *raw = nullptr;
+		if (static_cast<int8_t>(acc[0x1190]) < 0) {
+			auto *base = *reinterpret_cast<uint8_t **>(acc + 0x1240);
+			auto *c28 = *reinterpret_cast<uint8_t **>(cs + 0x28);
+			if (base && c28) raw = base + *reinterpret_cast<uint32_t *>(c28 + 0x29) + idx * 8;
+		} else {
+			auto *b68 = *reinterpret_cast<uint8_t **>(cs + 0x68);
+			if (b68) raw = b68 + 0x40 + idx * 8;
+		}
+		if (raw) { lo = reinterpret_cast<volatile uint32_t *>(raw)[0]; hi = reinterpret_cast<volatile uint32_t *>(raw)[1]; }
+	}
+	uint64_t r = FunctionCast(xeCsbDetail, gOrgCsbDetail)(that, out, idxp);
+	// sem IOLog aqui (pode ser contexto de interrupção): grava num buffer que o worker de 2 s imprime
+	uint32_t k = __atomic_fetch_add(&gCsbN, 1, __ATOMIC_RELAXED);
+	{  // 19/10: anel circular
+		auto &e = gCsbLog[k % XE_CSB_MAX];
+		e.cs = (uint32_t)(uintptr_t)that & 0xfff0; e.idx = idx; e.lo = lo; e.hi = hi; e.tipo = out ? out[0] : 0;
+		e.cur = *reinterpret_cast<uint32_t *>(cs + 0x50);
+		e.portas = (*reinterpret_cast<void **>(cs + 0x30) != nullptr) << 3 | (*reinterpret_cast<void **>(cs + 0x38) != nullptr) << 2 |
+				   (*reinterpret_cast<void **>(cs + 0x40) != nullptr) << 1 | (*reinterpret_cast<void **>(cs + 0x48) != nullptr);
+		e.t = mach_absolute_time();
+	}
+	return r;
+}
+// xe/evaldiag (19/10): eventos genéricos (tag, a, b, c) no mesmo esquema de buffer (seguro em interrupção).
+#define XE_EV_MAX 16384
+struct XeEv { uint32_t tag, a, b, c; uint64_t t; };
+static XeEv gEvLog[XE_EV_MAX];
+static uint32_t gEvN = 0, gEvPrinted = 0;
+static void xeEv(uint32_t tag, uint32_t a, uint32_t b, uint32_t c) {
+	uint32_t k = __atomic_fetch_add(&gEvN, 1, __ATOMIC_RELAXED);
+	// 19/10: anel circular (antes enchia em ~130 s e os restarts seguintes ficavam sem eventos)
+	{ auto &e = gEvLog[k % XE_EV_MAX]; e.tag = tag; e.a = a; e.b = b; e.c = c; e.t = mach_absolute_time(); }
+}
+static mach_vm_address_t gOrgEvalWait = 0, gOrgVerifyThr = 0, gOrgPrepSubmit = 0;
+// xe/csbguard (19/10): pânico "EL[0] was invalidated!!" ao trocar o modo da tela: na interrupção de troca de contexto,
+// csbProcessActiveToIdle recebeu um evento active->idle com o EL[0] já vazio (evento repetido/atrasado) e
+// ContextStatusBufferValidate entrou em pânico. Descarta o evento nos dois casos do validate (EL nulo ou ID de contexto
+// diferente) e registra 'CSBX'. -ngreennocsbguard desliga.
+static mach_vm_address_t gOrgCsbA2I = 0, gOrgCsbPreempt = 0, gOrgCsbElSwitch = 0;
+// xe/nopage (19/10): pânico em IGAccelResource::pageon (Ajustes > Telas e troca de DPI: o WallpaperImageExtension leu a
+// lista de retângulos de um nível além do fim, numa página não mapeada; contagem 0x79a8). Com memória unificada, não
+// paginar texturas: pageoff/pageon viram no-op, como os de IOAccelResource2 (corpo vazio). -ngreenpaging volta ao original.
+static mach_vm_address_t gOrgPageoff = 0, gOrgPageon = 0;
+static int xeNoPaging() {
+	static int v = -1;
+	// 19/10: REVERTIDO para opt-in: com o no-op as janelas ficaram vazias (pgoff=771 pgon=2069 em ~3 min; o pageon
+	// é usado na preparação normal das texturas, não só depois de pressão de memória). Só com -ngreennopaging.
+	if (v < 0) v = checkKernelArgument("-ngreennopaging") ? 1 : 0;
+	return v;
+}
+// xe/pagesync (20/10): pageon/pageoff copiam IOSurface <-> device cache no motor de cópia (BCS) e voltam sem esperar;
+// quem ordena o render/compute depois da cópia é o barrierSubmission da Apple (MI_SEMAPHORE_WAIT no stamp do BCS), que o
+// Gen11::barrierSubmission (V130) pula no RPL. Sem isso o shader lia a superfície pela metade e as escritas voltavam
+// misturadas (testes de 20/10: 3-53% certos com offset 32, 88-99% alinhado). Depois do original, espera o evento da
+// cópia na CPU com IOAccelEventMachineFast2::finishEvent (vtable +0x188, o mesmo fallback do barrierSubmission da
+// Apple). accel = resource+0x18, máquina de eventos = accel+0x380. -ngreennopagesync desliga.
+static uint32_t gPageSyncN = 0;
+static void xePageSync(void *that, void *ev) {
+	static int on = -1;
+	if (on < 0) on = checkKernelArgument("-ngreennopagesync") ? 0 : 1;
+	if (on != 1 || !that || !ev) return;
+	auto *acc = *reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(that) + 0x18);
+	auto *em = acc ? *reinterpret_cast<void **>(acc + 0x380) : nullptr;
+	auto *vt = em ? *reinterpret_cast<void ***>(em) : nullptr;
+	if (!vt || !vt[0x188 / 8]) return;
+	reinterpret_cast<void (*)(void *, void *)>(vt[0x188 / 8])(em, ev);
+	gPageSyncN++;
+}
+static void xePageoff(void *that, void *ev, bool b, bool *out, uint64_t x) {
+	if (xeNoPaging()) { gPageoffN++; return; }
+	FunctionCast(xePageoff, gOrgPageoff)(that, ev, b, out, x);
+	xePageSync(that, ev);
+}
+// xe/pageonguard (19/10): o no-op estragou as janelas. Guard cirúrgico: antes do original, para cada entrada de nível
+// (resource+0x250, (faces=+0xac) x (níveis=+0xad), 40 B; contagem u16 em +0x18, array de pares u32 em +0x20) confere pelo
+// pmap que o array inteiro está mapeado; se não estiver, zera a contagem (só aquele nível não é restaurado).
+static mach_vm_address_t gPmapFindPhys = 0, gKernelPmap = 0;
+static bool xeMapeado(uint64_t va) {
+	if ((va >> 47) != 0x1ffff) return false;  // não canônico / não é endereço do kernel
+	if (!gPmapFindPhys || !gKernelPmap) return true;
+	void *kp = *reinterpret_cast<void **>(gKernelPmap);
+	return reinterpret_cast<uint32_t (*)(void *, uint64_t)>(gPmapFindPhys)(kp, va) != 0;
+}
+// xe/vadiag (21/10, default on, -ngreennovadiag disables): hardware video decode returned empty frames. Every decode submission is
+// "dropped on floor" by IOAccelFIFOChannel2::submitCommands because IGAccelVideoContext::bind_resource clears
+// info.valid (+0x3c) for the FIRST relocation it binds (any handle; user-space bisect). This hook only classifies the
+// failure, no behaviour change: *addr/*pitch get sentinels before the original call:
+//   res==0                    -> IOAccelContext2::lookupResource failed (handle not in the IOAccelShared2 namespace)
+//   res!=0, addr==sentinel    -> IOAccelContext2::bindResource failed (Tahoe: write check on accel+0xc90 bit 30 /
+//                                res+0xd bit 1, or IOAccelResource2::prepare() -> map()/memory map list)
+//   addr set, pitch==0        -> IGAccelResource::get_tex_data found no plane/size (resource layout/type)
+// Logs the first 48 failures and counts all of them (gVaBindFail/gVaBindOk).
+static mach_vm_address_t gOrgVaBind = 0;
+static uint32_t gVaBindFail = 0, gVaBindOk = 0;
+static bool xeVaBind(void *that, void *info, uint32_t handle, void **res, uint64_t *addr, uint32_t *pitch, bool write) {
+	auto *inf = static_cast<uint8_t *>(info);
+	uint8_t validBefore = inf ? inf[0x3c] : 0xff;
+	if (addr) *addr = 0xdeadbeefdeadbeefULL;
+	if (pitch) *pitch = 0xdeadbeef;
+	bool r = FunctionCast(xeVaBind, gOrgVaBind)(that, info, handle, res, addr, pitch, write);
+	if (r) { gVaBindOk++; return r; }
+	if (gVaBindFail++ < 48) {
+		auto *rs = (res && *res) ? static_cast<uint8_t *>(*res) : nullptr;
+		const char *why = !rs ? "lookup" : (addr && *addr == 0xdeadbeefdeadbeefULL) ? "bindResource/prepare" : (pitch && *pitch == 0) ? "get_tex_data pitch=0" : "other";
+		IOLog("XeNG VADIAG bind fail #%u: h=%#x w=%d valid %u->%u why=%s res=%p type=%#x f0d=%#x f0e=%#x prep=%u map=%p addr=%#llx pitch=%#x (ok=%u)\n",
+		      gVaBindFail, handle, write, validBefore, inf ? inf[0x3c] : 0xff, why, rs, rs ? rs[0x14] : 0, rs ? rs[0xd] : 0, rs ? rs[0xe] : 0,
+		      rs ? *reinterpret_cast<uint32_t *>(rs + 0x28) : 0, rs ? *reinterpret_cast<void **>(rs + 0x40) : nullptr,
+		      addr ? (unsigned long long)*addr : 0ULL, pitch ? *pitch : 0, gVaBindOk);
+	}
+	return r;
+}
+static void xePageon(void *that, void *ev, bool b, uint64_t x) {
+	if (xeNoPaging()) { gPageonN++; return; }
+	static int guard = -1;
+	// 20/10: opt-in (-ngreenpageonguard) até testar isolado
+	// 20/10 01h20: LIGADO por padrão (os 3 últimos pânicos foram GP fault aqui: ponteiro não canônico); -ngreennopageonguard desliga
+	if (guard < 0) guard = checkKernelArgument("-ngreennopageonguard") ? 0 : 1;
+	if (guard == 1 && that) {
+		auto *r = static_cast<uint8_t *>(that);
+		auto *ent = *reinterpret_cast<uint8_t **>(r + 0x250);
+		uint32_t n = (uint32_t)r[0xac] * (uint32_t)r[0xad];
+		if (ent && n && n <= 4096 && xeMapeado((uint64_t)ent) && xeMapeado((uint64_t)ent + n * 40 - 1)) {
+			for (uint32_t i = 0; i < n; i++) {
+				uint8_t *e = ent + (uint64_t)i * 40;
+				uint16_t cnt = *reinterpret_cast<uint16_t *>(e + 0x18);
+				uint64_t arr = *reinterpret_cast<uint64_t *>(e + 0x20);
+				if (!cnt || !arr) continue;
+				bool ok = xeMapeado(arr) && xeMapeado(arr + (uint64_t)cnt * 8 - 1);
+				for (uint64_t pg = (arr & ~0xFFFull) + 0x1000; ok && pg < arr + (uint64_t)cnt * 8; pg += 0x1000) ok = xeMapeado(pg);
+				if (!ok) { *reinterpret_cast<uint16_t *>(e + 0x18) = 0; gPageonFix++; }
+			}
+		}
+	}
+	FunctionCast(xePageon, gOrgPageon)(that, ev, b, x);
+	xePageSync(that, ev);
+}
+// 19/10: o mesmo pânico veio também de csbProcessPreempted (troca para "itens grandes"); os 3 tratadores que chamam
+// ContextStatusBufferValidate passam pelo mesmo teste. elSwitch: também exige o EL[1] (+0x38), que ele lê em seguida.
+static bool xeCsbEventoInvalido(void *that, const uint32_t *e, bool exigeEl1, uint32_t tag) {
+	static int guard = -1;
+	if (guard < 0) guard = checkKernelArgument("-ngreennocsbguard") ? 0 : 1;
+	if (guard != 1 || !that || !e) return false;
+	auto *cs = static_cast<uint8_t *>(that);
+	uint32_t idx = *reinterpret_cast<uint32_t *>(cs + 0x50);
+	auto *el = *reinterpret_cast<uint8_t **>(cs + 0x30 + (uint64_t)idx * 16);
+	auto *el1 = *reinterpret_cast<uint8_t **>(cs + 0x38 + (uint64_t)idx * 16);
+	uint32_t id = (e[1] >> 5) & 0x7ff;
+	auto *ctx = el ? *reinterpret_cast<uint8_t **>(el) : nullptr;
+	if (!el || !ctx || *reinterpret_cast<uint32_t *>(ctx + 0x7c) != id || (exigeEl1 && !el1)) {
+		xeEv(tag, idx, id, ++gCsbSkipN);
+		return true;
+	}
+	return false;
+}
+// xe/csbresync (21/10): hang do WindowServer (antes do login e após troca de modo/DPI). Em todo travamento o
+// CSBX descartou o "active->idle" REAL de um contexto curto (~200 us após o EXEC): o "idle->active" correspondente
+// não foi processado, então o elemento ficou no slot pendente (1-cur) e EL[cur] estava vazio. Descartar deixa a
+// execlist "ocupada" para sempre com a GPU ociosa (EXECLIST_STATUS 0x18001): o stamp nunca anda, o IOAF chama
+// eventTimeout -> checkForProgress (3,3 s) -> getActiveContexts vazio -> "GPURestartSkipped / no channel" a cada 5 s.
+// Em vez de descartar: se EL[cur] está vazio e o slot pendente tem exatamente esse contexto, sintetiza o
+// idle->active que faltou (csbProcessIdleToActive original: troca cur e limpa o slot velho) e processa o evento.
+// Eventos realmente repetidos/atrasados (nenhum slot bate) continuam descartados. -ngreennocsbresync desliga.
+static mach_vm_address_t gOrgCsbI2A = 0;  // só resolvido, não roteado
+static bool xeCsbResync(void *that, const uint32_t *e) {
+	static int on = -1;
+	if (on < 0) on = checkKernelArgument("-ngreennocsbresync") ? 0 : 1;
+	if (on != 1 || !gOrgCsbI2A || !that || !e) return false;
+	auto *cs = static_cast<uint8_t *>(that);
+	uint32_t idx = *reinterpret_cast<uint32_t *>(cs + 0x50);
+	if (idx > 1) return false;
+	uint32_t pend = 1 - idx;
+	auto *elCur = *reinterpret_cast<uint8_t **>(cs + 0x30 + (uint64_t)idx * 16);
+	auto *elPend = *reinterpret_cast<uint8_t **>(cs + 0x30 + (uint64_t)pend * 16);
+	auto *ctxPend = elPend ? *reinterpret_cast<uint8_t **>(elPend) : nullptr;
+	uint32_t id = (e[1] >> 5) & 0x7ff;
+	if (elCur || !ctxPend || *reinterpret_cast<uint32_t *>(ctxPend + 0x7c) != id) return false;
+	reinterpret_cast<void (*)(void *, const uint32_t *)>(gOrgCsbI2A)(that, e);  // não lê 'e'; cur := pend
+	xeEv('CSBR', idx, id, ++gCsbResyncN);
+	return true;
+}
+static void xeCsbA2I(void *that, const uint32_t *e) {
+	if (xeCsbEventoInvalido(that, e, false, 'CSBX')) {
+		if (!xeCsbResync(that, e)) return;
+		if (xeCsbEventoInvalido(that, e, false, 'CSBY')) return;  // não deveria acontecer
+	}
+	FunctionCast(xeCsbA2I, gOrgCsbA2I)(that, e);
+}
+static void xeCsbPreempt(void *that, const uint32_t *e) {
+	if (xeCsbEventoInvalido(that, e, false, 'CSBP')) return;
+	FunctionCast(xeCsbPreempt, gOrgCsbPreempt)(that, e);
+}
+static void xeCsbElSwitch(void *that, const uint32_t *e) {
+	if (xeCsbEventoInvalido(that, e, true, 'CSBS')) return;
+	FunctionCast(xeCsbElSwitch, gOrgCsbElSwitch)(that, e);
+}
+static uint64_t xeEvalWait(void *that, const bool *thr, bool x, bool y) {
+	uint64_t r = FunctionCast(xeEvalWait, gOrgEvalWait)(that, thr, x, y);
+	auto *cs = static_cast<uint8_t *>(that);
+	(void)cs; (void)thr; (void)x; (void)y;  // 19/10: EVAL não é mais registrado (tempestade enchia o buffer)
+	return r;
+}
+static uint64_t xeVerifyThr(void *that, bool *out) {
+	uint64_t r = FunctionCast(xeVerifyThr, gOrgVerifyThr)(that, out);
+	// 19/10: era chamado ~6000x/s (dequeueExecList em laço) e o log disso inundava o dmesg; agora só conta
+	__atomic_fetch_add(&gThrtN, 1, __ATOMIC_RELAXED);
+	if (out && *out) __atomic_fetch_add(&gThrtSimN, 1, __ATOMIC_RELAXED);
+	return r;
+}
+// xe/fwsubmit (19/10): a execlist escrita logo depois do fim do CSB se perdia (motor recém-ocioso em RC6). Segura o
+// forcewake de Render+Blitter num bit próprio (ctx=3) em volta da submissão. Desliga com -ngreennofwsubmit.
+static uint64_t xePrepSubmit(void *that, uint32_t a, uint32_t b, const uint32_t *c) {
+	xeEv('SUBM', (uint32_t)(uintptr_t)that & 0xfff0, a, b);
+	static int fwSub = -1;
+	if (fwSub < 0) fwSub = checkKernelArgument("-ngreennofwsubmit") ? 0 : 1;
+	auto *acc = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + 0x10);
+	if (fwSub == 1 && acc) Gen11::xeForceWakePub(acc, true, 0b101, 3);
+	// xe/elsqwait (19/10): a submissão escrita logo depois do "terminou" de um contexto se perdia: o EXECLIST_STATUS
+	// ainda mostrava o contexto anterior com o bit 0x40000000 (troca/salvamento em andamento). No RPL a escrita na
+	// ELSQ nessa janela é descartada. Espera o bit cair (passos de 5 us, até 2 ms). Desliga com -ngreennoelsqwait.
+	static int elsqWait = -1;
+	if (elsqWait < 0) elsqWait = checkKernelArgument("-ngreennoelsqwait") ? 0 : 1;
+	auto *c28 = *reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(that) + 0x28);
+	if (elsqWait == 1 && NGreen::callback && c28) {
+		uint32_t eb = c28[0] == 0 ? 0x2000 : 0x22000;
+		uint32_t st0 = NGreen::callback->readReg32(eb + 0x234), st = st0, us = 0;
+		while ((st & 0x40000000) && us < 2000) { IODelay(5); us += 5; st = NGreen::callback->readReg32(eb + 0x234); }
+		if (st0 & 0x40000000) xeEv('WAIT', st0, st, us);
+		// xe/elsqdelay (19/10): a submissão escrita no mesmo instante em que o contexto anterior termina se perde
+		// (com ctx7 também, não só ctx16). Atraso curto antes de cada submissão do RCS; ngreenelsqdelay=N (us), 0 desliga.
+		static int dly = -1;
+		if (dly < 0) { int v = 0; PE_parse_boot_argn("ngreenelsqdelay", &v, sizeof(v)); dly = (v >= 0 && v <= 5000) ? v : 50; }
+		if (eb == 0x2000) {
+			uint32_t pre = NGreen::callback->readReg32(eb + 0x234), preHi = NGreen::callback->readReg32(eb + 0x238);
+			uint32_t csp = NGreen::callback->readReg32(eb + 0x3a0);
+			xeEv('PRE0', pre, preHi, csp);
+			// xe/elsqidle (19/10): submissões boas encontram EXECLIST_STATUS lo = 0x...01 (ocioso, hi=0); a perdida
+			// encontrou 0x00018098 com o contexto anterior ainda atual (hi=ID), mesmo depois do CSB "terminou".
+			// Espera o motor sair desse estado (bit 0x80 ou byte baixo != 0x01), passos de 5 us, até 2 ms.
+			// Só quando havia contexto atual (hi != 0); -ngreennoelsqidle desliga.
+			static int idleW = -1;
+			// 20/10: DESLIGADO por padrão: com o SAMETAIL não houve mais eventos inválidos (csbx=0) e as esperas somavam
+			// 8-16 s de CPU parada em ~3 min (mouse a cada 20 s, congelamento). -ngreenelsqidle religa.
+			// 20/10 02h30: RELIGADO: sem ele voltou o hang do Blit3D lendo página scratch (c01dbead) — 2 boots seguidos,
+			// nunca com a espera ligada. Limite agora de 5 ms. -ngreennoelsqidle desliga.
+			if (idleW < 0) idleW = checkKernelArgument("-ngreennoelsqidle") ? 0 : 1;
+			// 19/10 (XE-NOPREEMPT): as recusas acontecem com arbitragem ligada (bit 16) e contexto atual — a nova
+			// submissão dispara preempção, que emperra o RCS no RPL. Espera até 50 ms (ngreenpreemptwait=us) o motor
+			// ficar ocioso (byte baixo 0x01) ou a arbitragem desligar, para nunca preemptar.
+			static int maxw = -1;
+			// 19/10: 50 ms -> 2 ms. Medido: 1444 esperas = 5,4 s em ~3 min, 8 batendo no limite (travadas visíveis). A causa dos
+				// hangs que a espera contornava (kernels blit3d zerados, VS herdado) já foi corrigida.
+				// 19/10 23h45: 2 ms trouxe de volta artefatos (861 envios com o motor ocupado em ~3 min); meio-termo de 15 ms.
+				// 20/10: de volta a 50 ms (valor da "versão boa"); 2 e 15 ms vieram junto com glitches novos
+				if (maxw < 0) { int v = 5000; PE_parse_boot_argn("ngreenpreemptwait", &v, sizeof(v)); maxw = (v >= 0 && v <= 200000) ? v : 5000; }
+			// 19/10 (XE-IDLEANY): o hang do login começou numa submissão com o RCS ocupado SEM bit 16 (0x3098, ctx5
+			// rodando o clear) que reenviou o ctx5 (lite restore) com o ctx7 no elemento 1. Agora espera o ocioso
+			// mesmo sem arbitragem; -ngreenidlearb volta à condição antiga (só com bit 16).
+			static int arbOnly = -1;
+			if (arbOnly < 0) arbOnly = checkKernelArgument("-ngreenidlearb") ? 1 : 0;
+			uint32_t arbMask = arbOnly ? 0x10000 : 0;
+			if (idleW == 1 && preHi != 0 && (pre & 0xff) != 0x01 && (!arbMask || (pre & arbMask))) {
+				uint32_t st = pre, hi = preHi, us = 0;
+				while (((st & 0xff) != 0x01) && (!arbMask || (st & arbMask)) && hi != 0 && us < (uint32_t)maxw) {
+					IODelay(5); us += 5;
+					st = NGreen::callback->readReg32(eb + 0x234); hi = NGreen::callback->readReg32(eb + 0x238);
+				}
+				xeEv('IDLW', st, hi, us);
+				gIdlwN++; gIdlwUs += us; if (us > gIdlwMax) gIdlwMax = us; if (us >= (uint32_t)maxw) gIdlwTimeout++;
+			} else if (dly) IODelay((unsigned)dly);
+		}
+	}
+	uint64_t r = FunctionCast(xePrepSubmit, gOrgPrepSubmit)(that, a, b, c);
+	if (fwSub == 1 && acc) Gen11::xeForceWakePub(acc, false, 0b101, 3);
+	return r;
+}
+static void xeEvDumpRecent(uint32_t count, int seq) {
+	{
+		uint32_t cn = __atomic_load_n(&gCsbN, __ATOMIC_RELAXED), cf = cn > 40 ? cn - 40 : 0;
+		for (uint32_t i = cf; i < cn; i++) {
+			auto &e = gCsbLog[i % XE_CSB_MAX];
+			uint64_t ns = 0; absolutetime_to_nanoseconds(e.t, &ns);
+			IOLog("XeNG D%d CSB #%u t=%llu.%06llu cs=%x idx=%u raw=%08x:%08x tipo=%08x cur=%u portas=%x\n", seq, i + 1,
+				  ns / 1000000000ULL, (ns / 1000ULL) % 1000000, e.cs, e.idx, e.hi, e.lo, e.tipo, e.cur, e.portas);
+		}
+	}
+	uint32_t n = __atomic_load_n(&gEvN, __ATOMIC_RELAXED);
+	uint32_t from = n > count ? n - count : 0;
+	IOLog("XeNG CSBDUMP #%d: eventos %u..%u (skip=%u)\n", seq, from + 1, n, gCsbSkipN);
+	for (uint32_t i = from; i < n; i++) {
+		auto &e = gEvLog[i % XE_EV_MAX];
+		uint64_t ns = 0; absolutetime_to_nanoseconds(e.t, &ns);
+		char tag[5] = {(char)(e.tag >> 24), (char)(e.tag >> 16), (char)(e.tag >> 8), (char)e.tag, 0};
+		IOLog("XeNG D%d #%u t=%llu.%06llu %s a=%x b=%x c=%x\n", seq, i + 1, ns / 1000000000ULL, (ns / 1000ULL) % 1000000, tag, e.a, e.b, e.c);
+	}
+}
+static void xeEvFlush() {
+	uint32_t n = __atomic_load_n(&gEvN, __ATOMIC_RELAXED);
+	if (n - gEvPrinted > XE_EV_MAX - 1024) {  // o worker ficou para trás: pula para os mais recentes
+		IOLog("XeNG EV perdidos %u\n", n - gEvPrinted - (XE_EV_MAX - 1024));
+		gEvPrinted = n - (XE_EV_MAX - 1024);
+	}
+	uint32_t lim = gEvPrinted + 800;
+	for (; gEvPrinted < n && gEvPrinted < lim; gEvPrinted++) {
+		auto &e = gEvLog[gEvPrinted % XE_EV_MAX];
+		uint64_t ns = 0; absolutetime_to_nanoseconds(e.t, &ns);
+		char tag[5] = {(char)(e.tag >> 24), (char)(e.tag >> 16), (char)(e.tag >> 8), (char)e.tag, 0};
+		IOLog("XeNG EV #%u t=%llu.%03llu %s a=%x b=%x c=%x\n", gEvPrinted + 1, ns / 1000000000ULL, (ns / 1000000ULL) % 1000, tag, e.a, e.b, e.c);
+	}
+}
+static void xeCsbFlush() {
+	uint32_t n = __atomic_load_n(&gCsbN, __ATOMIC_RELAXED);
+	if (n - gCsbPrinted > XE_CSB_MAX - 256) gCsbPrinted = n - (XE_CSB_MAX - 256);
+	uint32_t lim = gCsbPrinted + 400;
+	for (; gCsbPrinted < n && gCsbPrinted < lim; gCsbPrinted++) {
+		auto &e = gCsbLog[gCsbPrinted % XE_CSB_MAX];
+		uint64_t ns = 0; absolutetime_to_nanoseconds(e.t, &ns);
+		IOLog("XeNG CSB #%u t=%llu.%03llu cs=%x idx=%u raw=%08x:%08x tipo=%08x cur=%u portas=%x\n", gCsbPrinted + 1,
+			  ns / 1000000000ULL, (ns / 1000000ULL) % 1000, e.cs, e.idx, e.hi, e.lo, e.tipo, e.cur, e.portas);
+	}
+}
+
+// xe/posh (19/10): o ctx18 (1ª submissão nunca começa) vem de restoreFromSafeImage, que copia a imagem-modelo; em
+// contextos SEM POSH (ctx+0x6e bit 4 = 0) o POSH_LRCA (0x21b0) fica com o buffer POSH do 1º contexto do boot.
+// Única diferença estrutural para o ctx16 (que roda). Zera o POSH_LRCA na página 1 desses contextos.
+// Desliga com -ngreennoposhfix.
+static mach_vm_address_t gOrgRestoreSafe = 0, gSmbGetVA = 0;
+static uint64_t xeRestoreSafe(void *that) {
+	// xe/poshctx (20/10): o RCS emperra em "troca de elemento pendente" (0x18098) depois que um contexto POSH
+	// (ctx+0x6e bit 0x10: CTX_CTRL bit4, buffer POSH, batches com bit 20) termina. O driver já diz PoshEnable=0 ao
+	// userspace. Apaga a flag na criação (antes de montar a imagem), para o contexto ser comum de ponta a ponta.
+	// -ngreenposhctx mantém o POSH.
+	{
+		static int keep = -1;
+		if (keep < 0) keep = checkKernelArgument("-ngreenposhctx") ? 1 : 0;
+		auto *c = static_cast<uint8_t *>(that);
+		if (!keep && (c[0x6e] & 0x10)) {
+			c[0x6e] &= ~0x10;
+			static volatile uint32_t n = 0;
+			if (++n <= 32) IOLog("XeNG POSHCTX: flag POSH apagada no contexto (#%u)\n", n);
+		}
+	}
+	uint64_t r = FunctionCast(xeRestoreSafe, gOrgRestoreSafe)(that);
+	static int arg = -1;
+	if (arg < 0) arg = checkKernelArgument("-ngreennoposhfix") ? 0 : 1;
+	auto *ctx = static_cast<uint8_t *>(that);
+	if (arg != 1 || !(r & 1) || (ctx[0x6e] & 0x10) || !gSmbGetVA) return r;
+	void *smb = *reinterpret_cast<void **>(ctx + 0x98);
+	if (!smb) return r;
+	auto *img = reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *(*)(void *)>(gSmbGetVA)(smb));
+	if (!img) return r;
+	volatile uint32_t *pg1 = img + 0x400;
+	for (int k = 1; k + 1 < 0x100; k++) {
+		if (pg1[k] == 0x21b0) {
+			uint32_t antes = pg1[k + 1];
+			pg1[k + 1] = 0;
+			static volatile uint32_t n = 0;
+			if (++n <= 32) IOLog("XeNG POSH ctx lrca=%x POSH_LRCA %x -> 0 (DW%x)\n", *reinterpret_cast<uint32_t *>(ctx + 0x89) & ~0xfffu, antes, k + 1);
+			break;
+		}
+	}
+	return r;
+}
+
+static mach_vm_address_t gHwCrtcToTimingAddr = 0;
+static thread_call_t gFbtTc = nullptr;
+static volatile uint32_t gFbtTries = 0, gFbtSeen = 0, gFbtOnline = 0, gFbtAlready = 0, gFbtBuilt = 0, gFbtRet = 0xffff;
+static volatile uint32_t gFbtH = 0, gFbtV = 0, gFbtDone = 0;
+
+static void fbTimingsWorker(thread_call_param_t, thread_call_param_t) {
+	gFbtTries++;
+	bool done = false;
+	if (gHwCrtcToTimingAddr) {
+		if (auto *match = IOService::serviceMatching("AppleIntelFramebufferDiags")) {
+			if (auto *it = IOService::getMatchingServices(match)) {
+				while (auto *obj = it->getNextObject()) {
+					auto *fb = OSDynamicCast(IOService, obj);
+					if (!fb || getMember<uint32_t>(fb, 0x1dc) != 0) continue;
+					gFbtSeen = 1;
+					if (getMember<uint8_t>(fb, 0x1e0) == 0) continue;
+					gFbtOnline = 1;
+					if (getMember<void *>(fb, 0x4260) != nullptr) { gFbtAlready = 1; done = true; break; }
+					// xe (19/10): hwCRTCToIODetailedTimingInformation divide por p->0x164, com
+					// p = *(fb + (fb->0x3fd8 != -1 ? 0x4a08 : 0x49f0)). Cedo no boot isso ainda vale 0 -> KERNEL PANIC
+					// "divide error" (boot 23:56). Só chama quando o divisor já existe; senão tenta de novo em 50 ms.
+					{
+						auto *pp = getMember<uint8_t *>(fb, getMember<int32_t>(fb, 0x3fd8) != -1 ? 0x4a08 : 0x49f0);
+						if (!pp || *reinterpret_cast<volatile uint32_t *>(pp + 0x164) == 0) continue;
+					}
+					IODetailedTimingInformationV2 t;
+					bzero(&t, sizeof(t));
+					auto ctrl = getMember<void *>(fb, 0x1d0);
+					typedef uint32_t (*crtc_fn)(void *, void *, void *);
+					gFbtRet = ((crtc_fn)gHwCrtcToTimingAddr)(ctrl, fb, &t);
+					gFbtH = t.horizontalActive; gFbtV = t.verticalActive;
+					if (t.horizontalActive == 0 || t.verticalActive == 0) continue; // CRTC ainda sem timing: tenta de novo
+					// O primeiro dword da entrada é o ID do modo: getCurrentDisplayMode faz fCurrentMode = *(uint32_t *)entrada ao casar
+					// com o CRTC, e validateDisplayMode exige ID >= 0x10000 (indice = ID & 0x3ff). 0x80001000 = indice 0.
+					*reinterpret_cast<uint32_t *>(&t) = 0x80001000u;
+					auto *arr = OSArray::withCapacity(1);
+					auto *dat = OSData::withBytes(&t, sizeof(t));
+					if (arr && dat) {
+						arr->setObject(dat);
+						fb->setProperty("IOFBDetailedTimings", arr);
+						getMember<OSArray *>(fb, 0x4260) = arr;
+						gFbtBuilt = 1;
+						done = true;
+						SYSLOG("ngreen", "fixbootmode: IOFBDetailedTimings injected early: %ux%u pclk=%llu", gFbtH, gFbtV,
+							   (unsigned long long)t.pixelClock);
+					}
+					if (dat) dat->release();
+					if (arr) arr->release(); // a propriedade mantém a referência
+					break;
+				}
+				it->release();
+			}
+			match->release();
+		}
+	}
+	if (done) { gFbtDone = 1; return; }
+	if (gFbtTries < 6000 && gFbtTc) { // 50 ms x 6000 = 5 min
+		uint64_t deadline;
+		clock_interval_to_deadline(50, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gFbtTc, deadline);
+	}
+}
+
 bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	if (kextG11FB.loadIndex == index) {
+		gIcLFbBlockRuns++;
 		if (this->tglFBLoaded) {
 			DBGLOG("ngreen", "Skipping ICL FB — TGL FB already loaded");
 			return true;
@@ -425,6 +1216,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		
 		
 	}	else if (kextG11FBT.loadIndex == index || kextG11FBTA.loadIndex == index) {
+		gTglFbBlockRuns++;
 		this->tglFBLoaded = true;
 		auto *activeKext = (kextG11FBTA.loadIndex == index) ? &kextG11FBTA : &kextG11FBT;
 		NGreen::callback->setRMMIOIfNecessary();
@@ -521,6 +1313,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
 			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
 			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
+			// 20/10 (XE-FBDPMS): repouso da tela sem desmontar pipe/transcoder/DDI (ver wrapSetFramebufferPowerState).
+			{"__ZN21AppleIntelFramebuffer24setFramebufferPowerStateEj", wrapSetFramebufferPowerState, this->oSetFramebufferPowerState},
 			// V208/V209/V210 routes DISABLED at 3/3/3 baseline. They actively cause
 			// the IOFramebuffer::getAttributeExt+0x25 NULL deref when fb1/fb2 start()
 			// is refused but IGAccelDisplayPipe still tracks them. Re-enable only
@@ -559,17 +1353,35 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			//{"__ZN24AppleIntelBaseController12SetupTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2P10CRTCParams", SetupTimings, this->oSetupTimings},
 			// Keep native detailed timing validation; avoid overriding pixel clock fields.
 			//{"__ZN21AppleIntelFramebuffer22validateDetailedTimingEPvy", validateDetailedTiming, this->ovalidateDetailedTiming},
-			//{"__ZN21AppleIntelFramebuffer19validateDisplayModeEiPPKNS_15ModeDescriptionEPPK29IODetailedTimingInformationV2", validateDisplayMode, this->ovalidateDisplayMode},
+			{"__ZN21AppleIntelFramebuffer19validateDisplayModeEiPPKNS_15ModeDescriptionEPPK29IODetailedTimingInformationV2", validateDisplayMode, this->ovalidateDisplayMode},
+			{"__ZN21AppleIntelFramebuffer21getCurrentDisplayModeEPiS0_", getCurrentDisplayMode, this->ogetCurrentDisplayMode},
 	   		//{"__ZN21AppleIntelFramebuffer18setupDisplayTimingEPK29IODetailedTimingInformationV2PS0_", setupDisplayTiming, this->osetupDisplayTiming},
 			//{"__ZN21AppleIntelFramebuffer18maxSupportedDepthsEPK29IODetailedTimingInformationV2", maxSupportedDepths, this->omaxSupportedDepths},
 			//{"__ZN21AppleIntelFramebuffer17validateModeDepthEPK29IODetailedTimingInformationV2j", validateModeDepth, this->ovalidateModeDepth},
 			//*****
-			//{"__ZN21AppleIntelFramebuffer19getPixelInformationEiiiP18IOPixelInformation", getPixelInformation, this->ogetPixelInformation},
+			{"__ZN21AppleIntelFramebuffer19getPixelInformationEiiiP18IOPixelInformation", getPixelInformation, this->ogetPixelInformation},
 			//{"__ZN20IntelFBClientControl11doAttributeEjPmmS0_S0_P25IOExternalMethodArguments",wrapFBClientDoAttribute, this->orgFBClientDoAttribute},
 			//{"__ZN20IntelFBClientControl24vendor_doDeviceAttributeEjPmmS0_S0_P25IOExternalMethodArguments", releaseDoorbell},
 			//{"__ZN21AppleIntelFramebuffer16enableControllerEv", isPanelPowerOn},
 		};
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route dp symbols");
+		gTglFbRoutesDone++;
+		if (checkKernelArgument("-ngreenfixbootmode")) {
+			SolveRequestPlus crtcSolve[] = {
+				{"__ZN24AppleIntelBaseController35hwCRTCToIODetailedTimingInformationEP21AppleIntelFramebufferP29IODetailedTimingInformationV2", gHwCrtcToTimingAddr},
+			};
+			if (SolveRequestPlus::solveAll(patcher, index, crtcSolve, address, size) && gHwCrtcToTimingAddr && !gFbtTc) {
+				gFbtTc = thread_call_allocate(fbTimingsWorker, nullptr);
+				if (gFbtTc) {
+					uint64_t deadline;
+					clock_interval_to_deadline(50, kMillisecondScale, &deadline);
+					thread_call_enter_delayed(gFbtTc, deadline);
+				}
+			}
+		}
+		gOrgGcdm = this->ogetCurrentDisplayMode; gOrgGpi = this->ogetPixelInformation; gOrgVdm = this->ovalidateDisplayMode;
+		SYSLOG("ngreen", "TGL FB routes applied (fixbootmode: getCurrentDisplayMode org=0x%llx, arg=%d)",
+			   (unsigned long long)this->ogetCurrentDisplayMode, (int)checkKernelArgument("-ngreenfixbootmode"));
 		
 		if (isprod) {
 			RouteRequestPlus requests[] = {
@@ -828,6 +1640,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesp , address, size), "ngreen", "kextG11FBT Failed to apply production patches!");
+			applyFixBootMode(patcher, activeKext, address, size);
 			if (enableTcon) {
 				LookupPatchPlus const tconPatches[] = {
 					{activeKext, f_tcon_camellia, r_tcon_camellia, arrsize(f_tcon_camellia), 1},
@@ -883,6 +1696,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
+			applyFixBootMode(patcher, activeKext, address, size);
 			if (enableTcon) {
 				LookupPatchPlus const tconPatches[] = {
 					{activeKext, f_tcon_camellia, r_tcon_camellia, arrsize(f_tcon_camellia), 1},
@@ -892,7 +1706,30 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				SYSLOG("ngreen", "Path E: TCON ID patches applied (dbg)");
 			}
 		}
-		
+
+		// xe/vald (19/10): no Tahoe todo flip do WindowServer era recusado com 0xe00002c7 por
+		// AppleIntelFramebuffer::ValidateTransaction (callPlatformFunction "vald", via IGAccelDisplayPipe::validateTransaction):
+		//  (1) getTransactionOptions() & 0x500 e (2) getPlaneTransactionOptions(p) & 0x500 -> unsupported
+		//      (bits que o IOAcceleratorFamily2 do Tahoe passa por padrão; no Big Sur tinham outro sentido);
+		//  (3) o formato de pixel é lido de IOSurface+0xa4 direto da memória: no Tahoe o layout do IOSurface mudou e
+		//      vem 0 (o IntelIGPU-Tahoe documenta o mesmo); sem a leitura fica o padrão da própria função, 'BGRA'.
+		// Padrões únicos no TGL FB 16.0 (0x3ecf1, 0x3ed1d, 0x3ed88). Não fatal: só registra se não achar.
+		{
+			static const uint8_t f_vopt[]  = {0xa9, 0x00, 0x05, 0x00, 0x00, 0x74, 0x17};
+			static const uint8_t r_vopt[]  = {0xa9, 0x00, 0x00, 0x00, 0x00, 0x74, 0x17};
+			static const uint8_t f_vpopt[] = {0xa9, 0x00, 0x05, 0x00, 0x00, 0x74, 0x1e};
+			static const uint8_t r_vpopt[] = {0xa9, 0x00, 0x00, 0x00, 0x00, 0x74, 0x1e};
+			static const uint8_t f_vfmt[]  = {0x8b, 0x80, 0xa4, 0x00, 0x00, 0x00, 0x89, 0x45, 0xb4};
+			static const uint8_t r_vfmt[]  = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+			LookupPatchPlus const p1[] = {{activeKext, f_vopt, r_vopt, arrsize(f_vopt), 1}};
+			LookupPatchPlus const p2[] = {{activeKext, f_vpopt, r_vpopt, arrsize(f_vpopt), 1}};
+			LookupPatchPlus const p3[] = {{activeKext, f_vfmt, r_vfmt, arrsize(f_vfmt), 1}};
+			bool a = LookupPatchPlus::applyAll(patcher, p1, address, size);
+			bool b = LookupPatchPlus::applyAll(patcher, p2, address, size);
+			bool c = LookupPatchPlus::applyAll(patcher, p3, address, size);
+			SYSLOG("ngreen", "XE-VALD: ValidateTransaction opts=%d planeopts=%d fmtBGRA=%d", a, b, c);
+		}
+
 		return true;
 		
 	}else if (kextG11HW.loadIndex == index) {
@@ -1078,6 +1915,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 // at VA 0xfffffff034136000 (page 0xD of context buffer). Our replacement skips the
 			 // dangerous memcpy and logs diagnostic info about the mapping.
 			 {"__ZN23IGHardwareBlit3DContext10initializeEv", IGHardwareBlit3DContextinitialize, this->oIGHardwareBlit3DContextinitialize},
+			 // 20/10 (XE-RESFREE): pânico kfree no Wallpaper em IGAccelResource::free; ver a função.
+			 {"__ZN15IGAccelResource4freeEv", IGAccelResourcefree, this->oIGAccelResourcefree},
+			 // 20/10 (XE-GTFREQ): sem GuC o pedido de frequência da Apple é sempre 0 -> GPU presa em 100 MHz.
+			 {"__ZN26IGHardwareCommandStreamer518setGTFrequencyMMIOEj", wrapSetGTFrequencyMMIO, this->oSetGTFrequencyMMIO},
+			 // 21/10 (XE-IDLEBOUND): IGScheduler5::waitForGpuIdle (stopGraphicsEngine no desligamento) espera até 25000 x 100 us.
+			 {"__ZN12IGScheduler514waitForGpuIdleEv", wrapWaitForGpuIdle, this->oWaitForGpuIdle},
 			 // V143: Register operator new for IGHardwareBlit3DContext so getBlit3DContext can
 			 // actually allocate the context object. Without this, oIGHardwareBlit3DContextoperatornew
 			 // is always null → alloc always returns nullptr → ctx=0 forever → NULL-task submitBlit
@@ -1145,6 +1988,57 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route symbols");
 		SYSLOG("ngreen", "V165: HW accelerator symbols routed OK");
 
+		if (checkKernelArgument("-ngreenxefix")) {  // xe/flipdiag: só contadores, sem mudar comportamento
+			RouteRequestPlus flipDiag[] = {
+				{"__ZN18IGAccelDisplayPipe17submitTransactionEP30IOAccelDisplayPipeTransaction2", xeDpSubmit, gOrgDpSubmit},
+				{"__ZN18IGAccelDisplayPipe21isTransactionCompleteEP30IOAccelDisplayPipeTransaction2", xeDpIsComplete, gOrgDpIsComplete},
+				{"__ZN18IGAccelDisplayPipe25signalTransactionCompleteEP12IOAccelEvent", xeDpSignal, gOrgDpSignal},
+				{"__ZN16IntelAccelerator24signalDisplayStampUpdateEij", xeDispStamp, gOrgDispStamp},
+				{"__ZN12IGScheduler54pushEP17IGHardwareContextjjbb", xeS5Push, gOrgS5Push},
+				{"__ZN12IGScheduler56notifyE10IGHwCsType", xeS5Notify, gOrgS5Notify},
+				{"__ZN26IGHardwareCommandStreamer514submitExecListEj", xeCs5Submit, gOrgCs5Submit},
+				{"__ZN12IGScheduler55pauseEv", xeS5Pause, gOrgS5Pause},
+				{"__ZN12IGScheduler56resumeEv", xeS5Resume, gOrgS5Resume},
+			};
+			RouteRequestPlus ringDiag[] = {
+				{"__ZN20IGHardwareRingBuffer12submitToRingEv", xeRbSubmit, gOrgRbSubmit},
+				{"__ZN20IGHardwareRingBuffer10writeStampEjb", xeRbWriteStamp, gOrgRbWriteStamp},
+				{"__ZN20IGHardwareRingBuffer23insertSemaphoreWaitPollEji", xeRbSemPoll, gOrgRbSemPoll},
+				{"__ZN26IGHardwareCommandStreamer516processCSBDetailEP28SGfxContextStatusBufferEntryRj", xeCsbDetail, gOrgCsbDetail},
+				{"__ZN26IGHardwareCommandStreamer522csbProcessActiveToIdleEPK28SGfxContextStatusBufferEntry", xeCsbA2I, gOrgCsbA2I},
+				{"__ZN15IGAccelResource7pageoffEP12IOAccelEventbPby", xePageoff, gOrgPageoff},
+				{"__ZN15IGAccelResource6pageonEP12IOAccelEventby", xePageon, gOrgPageon},
+				{"__ZN26IGHardwareCommandStreamer519csbProcessPreemptedEPK28SGfxContextStatusBufferEntry", xeCsbPreempt, gOrgCsbPreempt},
+				{"__ZN26IGHardwareCommandStreamer523csbProcessElementSwitchEPK28SGfxContextStatusBufferEntry", xeCsbElSwitch, gOrgCsbElSwitch},
+				{"__ZN26IGHardwareCommandStreamer513evalWaitQueueEPKbbb", xeEvalWait, gOrgEvalWait},
+				{"__ZN12IGScheduler516verifyThrottlingEPb", xeVerifyThr, gOrgVerifyThr},
+				{"__ZN26IGHardwareCommandStreamer524prepareExecListAndSubmitEjjPKj", xePrepSubmit, gOrgPrepSubmit},
+				{"__ZN17IGHardwareContext20restoreFromSafeImageEv", xeRestoreSafe, gOrgRestoreSafe},
+			};
+			SolveRequestPlus poshSolve[] = {{"__ZNK20IGSharedMappedBuffer17getVirtualAddressEv", gSmbGetVA}};
+			SolveRequestPlus csbI2ASolve[] = {{"__ZN26IGHardwareCommandStreamer522csbProcessIdleToActiveEPK28SGfxContextStatusBufferEntry", gOrgCsbI2A}};
+			if (!SolveRequestPlus::solveAll(patcher, index, csbI2ASolve, address, size)) { patcher.clearError(); gOrgCsbI2A = 0; }
+			IOLog("XeNG CSBRESYNC: idleToActive=%s\n", gOrgCsbI2A ? "ok" : "NAO");
+			gPmapFindPhys = patcher.solveSymbol(KernelPatcher::KernelID, "_pmap_find_phys");
+			if (!gPmapFindPhys) patcher.clearError();
+			gKernelPmap = patcher.solveSymbol(KernelPatcher::KernelID, "_kernel_pmap");
+			if (!gKernelPmap) patcher.clearError();
+			IOLog("XeNG PAGEONGUARD: pmap_find_phys=%s kernel_pmap=%s\n", gPmapFindPhys ? "ok" : "NAO", gKernelPmap ? "ok" : "NAO");
+			if (!SolveRequestPlus::solveAll(patcher, index, poshSolve, address, size)) { patcher.clearError(); IOLog("XeNG POSH: getVirtualAddress nao resolvido\n"); }
+			bool okr = RouteRequestPlus::routeAll(patcher, index, ringDiag, address, size);
+			if (!okr) patcher.clearError();
+			IOLog("XeNG RING diag hooks: %s\n", okr ? "OK" : "FALHOU");
+			if (!checkKernelArgument("-ngreennovadiag")) {  // log-only, default on (boot-args are near the 228-char limit)
+				RouteRequestPlus vaDiag[] = {{"__ZN19IGAccelVideoContext13bind_resourceER24IOAccelCommandStreamInfojPP15IGAccelResourcePyPjb", xeVaBind, gOrgVaBind}};
+				bool okv = RouteRequestPlus::routeAll(patcher, index, vaDiag, address, size);
+				if (!okv) patcher.clearError();
+				IOLog("XeNG VADIAG: bind_resource hook %s\n", okv ? "OK" : "FALHOU");
+			}
+			bool ok = RouteRequestPlus::routeAll(patcher, index, flipDiag, address, size);
+			if (!ok) patcher.clearError();
+			IOLog("XeNG FLIP diag hooks: %s\n", ok ? "OK" : "FALHOU");
+		}
+
 		{
 			RouteRequestPlus startRoute[] = {
 				{"__ZN16IntelAccelerator5startEP9IOService", start, this->ostart},
@@ -1191,7 +2085,36 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			if (forceFullMTL && wegCoexist) {
 				SYSLOG("ngreen", "FULL_MTL: forcing SafeForceWakeMultithreaded route despite coexist mode");
 			}
+			// xe/rc6fw (22/10): clamped SafeForceWake + idle release of leaked ctx-1 forcewake (see xeSafeForceWake)
+			if (!checkKernelArgument("-ngreennorc6fw")) {
+				uint32_t ms = 0;
+				if (PE_parse_boot_argn("ngreenfwidle", &ms, sizeof(ms)) && ms >= 100 && ms <= 60000) gRc6IdleMs = ms;
+				gRc6FwDrop = checkKernelArgument("-ngreenrc6fwnodrop") ? 0 : 1;
+				mach_vm_address_t sfw = patcher.solveSymbol(index, "__ZN16IntelAccelerator13SafeForceWakeEbj", address, size);
+				patcher.clearError();
+				bool sigCnt = false, sigLock = false;
+				if (sfw) {
+					static const uint8_t sCnt[] = {0x41, 0x8b, 0x85, 0x90, 0x12, 0x00, 0x00};   // movl 0x1290(%r13),%eax
+					static const uint8_t sLck[] = {0x49, 0x8b, 0x9d, 0x68, 0x14, 0x00, 0x00};   // movq 0x1468(%r13),%rbx
+					auto *pb = reinterpret_cast<const uint8_t *>(sfw);
+					for (size_t i = 0; i + sizeof(sCnt) <= 0x140; i++) {
+						if (!sigCnt && !memcmp(pb + i, sCnt, sizeof(sCnt))) sigCnt = true;
+						if (!sigLock && !memcmp(pb + i, sLck, sizeof(sLck))) sigLock = true;
+					}
+				}
+				if (sigCnt && sigLock) {
+					gFwSymAddr = sfw;
+					RouteRequestPlus rc6fw[] = {
+						{"__ZN16IntelAccelerator13SafeForceWakeEbj", xeSafeForceWake, gOrgSafeForceWake},
+					};
+					if (RouteRequestPlus::routeAll(patcher, index, rc6fw, address, size)) gRc6FwOn = 1;
+					else patcher.clearError();
+				}
+				SYSLOG("ngreen", "XE-RC6FW: sym=%d sig=%d/%d route=%d idle=%u drop=%d", sfw != 0, sigCnt, sigLock, gRc6FwOn, gRc6IdleMs, gRc6FwDrop);
+			}
 		}
+		// xe/gpurec (22/10): restore + replay the render-reset-domain sibling (RCS <-> CCS) after a GPU restart
+		if (!NGreen::callback->isRealTGL) xeGpuRecInstall(patcher, index, address, size);
 
 		if (!wegCoexist) {
 			RouteRequestPlus gpuInfoRoute[] = {
@@ -1225,7 +2148,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t f3b[] = {// jmp L3BankCount
 			0x74, 0x23, 0x83, 0xf9, 0x02, 0x0f, 0x85, 0x89, 0x01, 0x00, 0x00, 0x83, 0xfe, 0x01, 0x75, 0x59, 0x83, 0xfa, 0x0c, 0x75, 0x54, 0x41, 0xc7, 0x87, 0x64, 0x11, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00
 		};
-		static const uint8_t r3b[] = {
+		static uint8_t r3b[] = {  // xe/topo4: byte 28 = L3 (ngreen-l3)
 			0x90, 0x90, 0x83, 0xf9, 0x02, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x83, 0xfe, 0x01, 0x90, 0x90, 0x83, 0xfa, 0x0c, 0x90, 0x90, 0x41, 0xc7, 0x87, 0x64, 0x11, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00
 		};
 		
@@ -1249,7 +2172,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t f3bbb[] = {//NumSubSlices
 			0x8b, 0x5d, 0xd0, 0xf3, 0x0f, 0xb8, 0xf3, 0x01, 0xf6, 0x41, 0x89, 0xb7, 0x58, 0x11, 0x00, 0x00
 		};
-		static const uint8_t r3bbb[] = {
+		static uint8_t r3bbb[] = {  // xe/topo4: byte 4 = SS (ngreen-eu / 8)
 			0x8b, 0x5d, 0xd0, 0xbe, 0x0c, 0x00, 0x00, 0x00, 0x90, 0x41, 0x89, 0xb7, 0x58, 0x11, 0x00, 0x00
 		};
 		
@@ -1405,14 +2328,223 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			
 			if (!NGreen::callback->isRealTGL) {
 				// RPL-only: hardcode topology and bypass BCS readiness check
+				xeTopoArgs();
+				r3b[28] = (uint8_t)gTopoL3;
+				r3bbb[4] = (uint8_t)gTopoSs;
 				LookupPatchPlus const patchesRPL[] = {
-					{activeKext, f3b, r3b, arrsize(f3b),	1},      // L3BankCount=8
+					// xe/topo5: r3b/r3bbb are writable now; passed as const pointers so the (find, replace, size, count)
+					// constructor is used. As plain uint8_t[N] they matched the template (find[N], replace[N], count, skip),
+					// i.e. count=32 skip=1: the only match was skipped, the patch failed and PANIC_COND hung topo..topo4 at boot.
+					{activeKext, f3b, static_cast<const uint8_t *>(r3b), arrsize(f3b),	1},      // L3BankCount=8 (ngreen-l3)
 					{activeKext, f3bb, r3bb, arrsize(f3bb),	1},    // MaxEU/SS=8
-					{activeKext, f3bbb, r3bbb, arrsize(f3bbb),	1},// NumSubSlices=12
+					{activeKext, f3bbb, static_cast<const uint8_t *>(r3bbb), arrsize(f3bbb),	1},// NumSubSlices=12 (ngreen-eu)
 					{activeKext, f_devstart, m_devstart, r_devstart, rm_devstart, arrsize(f_devstart), 1}, // BCS bypass
 				};
 				PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesRPL, address, size), "ngreen",
 					"kextG11HWT Failed to apply RPL-specific patches!");
+
+				// xe/noccs3 (19/10): o XE-NOCCS2 (cortar enableRenderCompressionWithAccelTask inteira) deixava o driver Metal
+				// usando fast clear / stencil comprimido SEM mapeamento AUX -> hang do RCS no PIPE_CONTROL após o fast clear.
+				// O que panicava era só o RESOLVE: IntelAccelerator::submitCCSResolve -> resolve_ccs escreve no buffer 2 do
+				// IOAccelCommandBufferPool2, que no IOAcceleratorFamily2 do Tahoe não existe/difere (page fault).
+				// Agora: a compressão/AUX segue normal e submitCCSResolve retorna logo (xor eax,eax; ret); o chamador
+				// (IGAccelResource::submitCCSResolve) ignora o retorno. Prólogo (24 bytes, único) em 0x2c84c no 16.0.32.
+				static const uint8_t f_noccs3[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+				                                    0x53, 0x48, 0x83, 0xec, 0x48, 0x48, 0x89, 0x75, 0xc0, 0xf6, 0x87, 0x78};
+				static const uint8_t r_noccs3[] = {0x31, 0xc0, 0xc3, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+				                                    0x53, 0x48, 0x83, 0xec, 0x48, 0x48, 0x89, 0x75, 0xc0, 0xf6, 0x87, 0x78};
+				// xe/fmt (19/10): IGAccelDisplayPipe::performTransaction lê o formato do quadro de IOSurface+0xa4 direto da
+				// memória (0x81361 no 16.0.32). No Tahoe o layout do IOSurface mudou e vem 0 -> o FB programa o plano como
+				// YUV 4:2:2 (PLANE_CTL 0x90010400): tela verde em 2 tons + metade com lixo. Usa o formato do desktop, 'BGRA'.
+				static const uint8_t f_fmt[] = {0x8b, 0x83, 0xa4, 0x00, 0x00, 0x00, 0x89, 0x85, 0xf4, 0xfe, 0xff, 0xff};
+				static const uint8_t r_fmt[] = {0xb8, 0x41, 0x52, 0x47, 0x42, 0x90, 0x89, 0x85, 0xf4, 0xfe, 0xff, 0xff};
+				LookupPatchPlus const patchFmt[] = {{activeKext, f_fmt, r_fmt, arrsize(f_fmt), 1}};
+				SYSLOG("ngreen", "XE-FMT: performTransaction formato do IOSurface -> 'BGRA': %s",
+					   LookupPatchPlus::applyAll(patcher, patchFmt, address, size) ? "aplicado" : "NAO encontrado");
+				// xe/noposh (19/10): IGHardwareRingBuffer::submitBatchBuffer liga o bit 20 do MI_BATCH_BUFFER_START quando o
+				// contexto tem POSH (ctx+0x6e bit 0x10): (flags & 0x10) << 16. Só o ctx16 roda batches 0x18900101 e, depois dele,
+				// o RCS não troca mais de contexto (execlists válidas, nenhuma ativa). O RPL não tem o pipe POSH do TGL.
+				// "and eax,0x10" -> "and eax,0" em 0x43021 (único). Desliga com -ngreenposh.
+				static const uint8_t f_noposh[] = {0x31, 0xc9, 0x83, 0xe0, 0x10, 0x48, 0xc1, 0xe0, 0x10};
+				static const uint8_t r_noposh[] = {0x31, 0xc9, 0x83, 0xe0, 0x00, 0x48, 0xc1, 0xe0, 0x10};
+				if (checkKernelArgument("-ngreennoposh")) {  // 19/10: desligar o POSH deixou a tela preta; só por boot-arg
+					LookupPatchPlus const patchNoPosh[] = {{activeKext, f_noposh, r_noposh, arrsize(f_noposh), 1}};
+					bool okp = LookupPatchPlus::applyAll(patcher, patchNoPosh, address, size);
+					IOLog("XeNG NOPOSH: submitBatchBuffer sem bit POSH: %s\n", okp ? "aplicado" : "NAO encontrado");
+				}
+				LookupPatchPlus const patchNoCCS3[] = {{activeKext, f_noccs3, r_noccs3, arrsize(f_noccs3), 1}};
+				SYSLOG("ngreen", "XE-NOCCS3: IntelAccelerator::submitCCSResolve -> retorno imediato: %s",
+					   LookupPatchPlus::applyAll(patcher, patchNoCCS3, address, size) ? "aplicado" : "NAO encontrado");
+				// xe/nodepth (20/10): mesmo problema do NOCCS3 pelo caminho irmão. Pânico do iconservicesagent em resolve_hiz_g7
+				// <- IntelAccelerator::submitDepthResolve <- IGAccelResource::submitDepthResolve <- submitCCSResolve <-
+				// enableRenderCompressionWithAccelTask: o resolve HiZ também escreve no IOAccelCommandBufferPool2 do Tahoe.
+				// Os dois chamadores (0x744d7, 0x788e6) ignoram o retorno. Prólogo + "0f 84" (único) em 0x2c656 do 16.0.32.
+				// Desliga com -ngreendepthresolve.
+				static const uint8_t f_nodepth[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53,
+				                                     0x48, 0x83, 0xec, 0x38, 0xf6, 0x87, 0x78, 0x0c, 0x00, 0x00, 0x02, 0x0f, 0x84};
+				static const uint8_t r_nodepth[] = {0x31, 0xc0, 0xc3, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53,
+				                                     0x48, 0x83, 0xec, 0x38, 0xf6, 0x87, 0x78, 0x0c, 0x00, 0x00, 0x02, 0x0f, 0x84};
+				if (!checkKernelArgument("-ngreendepthresolve")) {
+					LookupPatchPlus const patchNoDepth[] = {{activeKext, f_nodepth, r_nodepth, arrsize(f_nodepth), 1}};
+					SYSLOG("ngreen", "XE-NODEPTH: IntelAccelerator::submitDepthResolve -> retorno imediato: %s",
+						   LookupPatchPlus::applyAll(patcher, patchNoDepth, address, size) ? "aplicado" : "NAO encontrado");
+				}
+				// xe/noaux (19/10): o RCS trava (sem fault) no PIPE_CONTROL depois de desenhar em RTs pequenos com
+				// RENDER_SURFACE_STATE AuxiliarySurfaceMode=5 (CCS_E): a AUX-TT não cobre essas superfícies no RPL.
+				// IGAccelResource::fillSurfaceStateAuxInfo põe aux=4/5 quando ResourceInfoEntry+0x91 bit 0x02; senão
+				// zera os 3 bits. "jne" (75 0b) -> NOPs em 0x73fd0 do 16.0.32: sempre aux=NONE. -ngreenccs desliga.
+				static const uint8_t f_noaux[] = {0xf6, 0x86, 0x91, 0x00, 0x00, 0x00, 0x02, 0x8b, 0x42, 0x18, 0x75, 0x0b,
+				                                  0x83, 0xe0, 0xf8, 0x89, 0x42, 0x18};
+				static const uint8_t r_noaux[] = {0xf6, 0x86, 0x91, 0x00, 0x00, 0x00, 0x02, 0x8b, 0x42, 0x18, 0x90, 0x90,
+				                                  0x83, 0xe0, 0xf8, 0x89, 0x42, 0x18};
+				// xe/notcf (19/10): o 1º restart de cada boot é o contexto do pipe de display parado no PIPE_CONTROL do flip
+				// (IGAccelDisplayPipe::generateFlip, dw1 0x50105021 = DC/RT/depth flush + CS stall + post-sync + TILE CACHE
+				// FLUSH), logo depois do desenho 3D do flip, com o 3D ocioso. O resto do driver usa 0x40105021 (sem o bit 28)
+				// e passa. Tira o Tile Cache Flush dos 3 "movabs rsi, 0x501050217a000004". -ngreentcf desliga.
+				static const uint8_t f_notcf[] = {0x48, 0xbe, 0x04, 0x00, 0x00, 0x7a, 0x21, 0x50, 0x10, 0x50};
+				static const uint8_t r_notcf[] = {0x48, 0xbe, 0x04, 0x00, 0x00, 0x7a, 0x21, 0x50, 0x10, 0x40};
+				// xe/notcf2 (19/10): o PIPE_CONTROL do anel que trava NÃO vem de lá: é o flush antes do stamp em
+				// IGHardwareRingBuffer{Main,Compute}::commitStampCommand(stamp, bool): dw1 = 0x40105021 | (bool << 28).
+				// "shl r14, 0x3c" -> "xor r14d, r14d; nop" (o bool continua salvo em [rbp-0x58] para o resto da função).
+				static const uint8_t f_notcf2[] = {0x4c, 0x89, 0x75, 0xa8, 0x49, 0xc1, 0xe6, 0x3c, 0x49, 0x09, 0xde};
+				static const uint8_t r_notcf2[] = {0x4c, 0x89, 0x75, 0xa8, 0x45, 0x31, 0xf6, 0x90, 0x49, 0x09, 0xde};
+				if (!checkKernelArgument("-ngreentcf")) {
+					LookupPatchPlus const patchNoTcf[] = {{activeKext, f_notcf, r_notcf, arrsize(f_notcf), 3}};
+					bool okt = LookupPatchPlus::applyAll(patcher, patchNoTcf, address, size);
+					IOLog("XeNG NOTCF: generateFlip PIPE_CONTROL sem Tile Cache Flush: %s\n", okt ? "aplicado" : "NAO encontrado");
+					LookupPatchPlus const patchNoTcf2[] = {{activeKext, f_notcf2, r_notcf2, arrsize(f_notcf2), 2}};
+					bool okt2 = LookupPatchPlus::applyAll(patcher, patchNoTcf2, address, size);
+					IOLog("XeNG NOTCF2: commitStampCommand sem Tile Cache Flush: %s\n", okt2 ? "aplicado" : "NAO encontrado");
+				}
+				// xe/blit16 (19/10): o hang do contexto Blit3D (usado pelo pipe de display) continua com o flush limpo: a
+				// Apple diz EUs/WMFE/PSS "not done" -> o PS do blit3d em SIMD32 (IGBlit3DKernel_default_simd32, KSP1=0x540)
+				// não termina no RPL. blit3d_submit_commands já usa SÓ SIMD16 (KSP0 = kernel simd16, dw7=0x60000) quando
+				// params+0x55 == 0x10; força esse caminho trocando "cmp cl,0x10" por "cmp cl,cl" (ZF=1) nos 3 pontos.
+				static const uint8_t f_b16a[] = {0x31, 0xf6, 0x80, 0xf9, 0x10, 0x40, 0x0f, 0x95, 0xc6};
+				static const uint8_t r_b16a[] = {0x31, 0xf6, 0x38, 0xc9, 0x90, 0x40, 0x0f, 0x95, 0xc6};
+				static const uint8_t f_b16b[] = {0x80, 0xf9, 0x10, 0x48, 0xbe, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00};
+				static const uint8_t r_b16b[] = {0x38, 0xc9, 0x90, 0x48, 0xbe, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00};
+				// xe/planes (19/10): abrir Ajustes > Telas dava pânico "divide error" em
+				// IGAccelResource::calculateIOSurfaceDeviceCacheVRAMBytes (0x72bcd, divl r15d = 0): a contagem de planos é
+				// lida direto de IOSurface+0xb0, offset que mudou no Tahoe (como o +0xa4 do XE-FMT), e superfícies comuns
+				// pareciam planares sem informação de plano. "mov eax,[rbx+0xb0]" -> "xor eax,eax" (sem planos).
+				// xe/planes2 (20/10): o "xor" fazia toda superfície ter 1 plano -> a tabela de planos (this+0x250) não tinha
+				// o plano 1 e get_tex_data devolvia endereço vazio: YUV (HEIC, vídeo) com croma zerado = papel de parede
+				// verde, quadros de vídeo vazios. No Tahoe IOSurface::getPlaneCount() lê [rdi+0x98] (KC 25G241), então
+				// lê do offset certo: "mov eax,[rbx+0x98]". -ngreenplanesxor volta ao patch antigo.
+				static const uint8_t f_planes[] = {0x8b, 0x83, 0xb0, 0x00, 0x00, 0x00, 0x85, 0xc0, 0xba, 0x01, 0x00, 0x00, 0x00};
+				static const uint8_t r_planes_xor[] = {0x31, 0xc0, 0x90, 0x90, 0x90, 0x90, 0x85, 0xc0, 0xba, 0x01, 0x00, 0x00, 0x00};
+				static const uint8_t r_planes_98[] = {0x8b, 0x83, 0x98, 0x00, 0x00, 0x00, 0x85, 0xc0, 0xba, 0x01, 0x00, 0x00, 0x00};
+				const uint8_t *r_planes = checkKernelArgument("-ngreenplanesxor") ? r_planes_xor : r_planes_98;
+				if (!checkKernelArgument("-ngreennoplanesfix")) {
+					LookupPatchPlus const patchPlanes[] = {{activeKext, f_planes, r_planes, arrsize(f_planes), 1}};
+					bool okp2 = LookupPatchPlus::applyAll(patcher, patchPlanes, address, size);
+					IOLog("XeNG PLANES2: calculateIOSurfaceDeviceCacheVRAMBytes planos de IOSurface+%s: %s\n", r_planes == r_planes_98 ? "0x98" : "nenhum (xor)", okp2 ? "aplicado" : "NAO encontrado");
+				}
+				// xe/blitalign (20/10): plano de IOSurface com offset não múltiplo de 64 (o CoreVideo usa 32 e 2073632 no 420v)
+				// = textura zerada e escrita perdida -> gravação de tela verde, conversões VTPixelTransfer vazias, Safari -6680.
+				// A GPU usa uma cópia da superfície (device cache, +0x04 da tabela de planos); pageon/pageoff copiam com
+				// IntelAccelerator::submitBlit. blit2d_common_supported exige (endereço & 0x3f) == 0 também para o
+				// XY_SRC_COPY_BLT comum (só o fast copy precisa de 64 B), e cópias lineares grandes não-fast vão para o
+				// blit 3D, que não funciona aqui. Máscara 0x3f -> 0x0f (origem e destino) e o "je" que manda cópia grande
+				// para o 3D vira nop: vão para blt2d_source_copy (motor de cópia). -ngreennoblitalign desliga.
+				static const uint8_t f_ba_src[] = {0x8b, 0x0f, 0x03, 0x4f, 0x2c, 0x83, 0xe1, 0x3f, 0x48, 0x85, 0xc9};
+				static const uint8_t r_ba_src[] = {0x8b, 0x0f, 0x03, 0x4f, 0x2c, 0x83, 0xe1, 0x0f, 0x48, 0x85, 0xc9};
+				static const uint8_t f_ba_dst[] = {0x8b, 0x4f, 0x48, 0x03, 0x4f, 0x74, 0x83, 0xe1, 0x3f, 0x48, 0x85, 0xc9};
+				static const uint8_t r_ba_dst[] = {0x8b, 0x4f, 0x48, 0x03, 0x4f, 0x74, 0x83, 0xe1, 0x0f, 0x48, 0x85, 0xc9};
+				// 21/10 (BLITALIGN v2): a v1 trocava o "je 3D" por nop e mandava TODA cópia linear grande não-fast para o
+				// blt2d_source_copy -> ícones/imagens do Chrome sumiam. Agora o bloco de roteamento (submitBlit 0x2c228,
+				// P = r14) só desvia para o 2D quando ((src|dst) & 0x3f) != 0; alinhadas voltam ao 3D como no original.
+				// src = [P]+[P+0x2c], dst = [P+0x48]+[P+0x74] (as mesmas expressões do blit2d_common_supported).
+				static const uint8_t f_ba_rota[] = {0x41,0x0f,0xb6,0x8e,0xa0,0x00,0x00,0x00,0x48,0x83,0xf9,0x10,0x0f,0x94,0xc0,0x48,0x0f,0xaf,0xd1,0x48,0x81,0xfa,0x01,0x10,0x05,0x00,0x0f,0x92,0xc1,0xbe,0x01,0x00,0x00,0x00,0x48,0x81,0xfa,0x01,0x00,0x02,0x00,0x0f,0x82,0xb5,0xfc,0xff,0xff,0x20,0xc8,0x0f,0x84,0xc9,0xfa,0xff,0xff,0xe9,0xa8,0xfc,0xff,0xff};
+				static const uint8_t r_ba_rota[] = {0x41,0x0f,0xb6,0x8e,0xa0,0x00,0x00,0x00,0x48,0x0f,0xaf,0xd1,0xbe,0x01,0x00,0x02,0x00,0x80,0xf9,0x10,0x75,0x05,0xbe,0x01,0x10,0x05,0x00,0x48,0x39,0xf2,0x72,0x19,0x41,0x8b,0x06,0x41,0x03,0x46,0x2c,0x41,0x8b,0x4e,0x48,0x41,0x03,0x4e,0x74,0x09,0xc8,0xa8,0x3f,0x0f,0x84,0xc7,0xfa,0xff,0xff,0xeb,0xbe,0xcc};
+				if (!checkKernelArgument("-ngreennoblitalign")) {
+					LookupPatchPlus const patchBa[] = {
+						{activeKext, f_ba_src, r_ba_src, arrsize(f_ba_src), 1},
+						{activeKext, f_ba_dst, r_ba_dst, arrsize(f_ba_dst), 1},
+						{activeKext, f_ba_rota, r_ba_rota, arrsize(f_ba_rota), 1}};
+					bool okba = LookupPatchPlus::applyAll(patcher, patchBa, address, size);
+					IOLog("XeNG BLITALIGN: cópias lineares de IOSurface desalinhadas (offset %% 64) pelo motor de cópia: %s\n", okba ? "aplicado" : "NAO encontrado");
+					// xe/blitfix (23/10): estende a v2 para pitch não múltiplo de 64 (ver xeBlitFixInstall). -ngreennoblitfix desliga.
+					if (okba && !checkKernelArgument("-ngreennoblitfix")) {
+						bool okbf = xeBlitFixInstall(patcher, activeKext, address, size, r_ba_rota, arrsize(r_ba_rota));
+						IOLog("XeNG BLITFIX: cópias de IOSurface com pitch %% 64 != 0 pelo motor de cópia: %s\n", okbf ? "aplicado" : "NAO encontrado");
+					}
+				}
+				// xe/rpcs (20/10, do WhateverXe 1163642): o construtor do contexto RCS grava R_PWR_CLK_STATE (0x20c8) = 0x80000000
+				// (só ENABLE). O Linux pede ENABLE | S_CNT_ENABLE | 1 fatia (0x80041000); o RPL também tem 1 fatia (SLICE_EN=1).
+				// "mov dword [r15+0x110c], 0x80000000" em 0x7c313 do 16.0.32. -ngreennorpcs desliga.
+				static const uint8_t f_rpcs[] = {0x41, 0xc7, 0x87, 0x0c, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80};
+				static const uint8_t r_rpcs[] = {0x41, 0xc7, 0x87, 0x0c, 0x11, 0x00, 0x00, 0x00, 0x10, 0x04, 0x80};
+				// 20/10: opt-in (-ngreenrpcs): o boot com RPCS+SAMETAIL ficou com o envio muito lento; isolando
+				if (checkKernelArgument("-ngreenrpcs")) {
+					LookupPatchPlus const patchRpcs[] = {{activeKext, f_rpcs, r_rpcs, arrsize(f_rpcs), 1}};
+					bool okr2 = LookupPatchPlus::applyAll(patcher, patchRpcs, address, size);
+					IOLog("XeNG RPCS: R_PWR_CLK_STATE do contexto RCS = 0x80041000: %s\n", okr2 ? "aplicado" : "NAO encontrado");
+				}
+				if (!checkKernelArgument("-ngreenblit32")) {
+					LookupPatchPlus const patchB16[] = {
+						{activeKext, f_b16a, r_b16a, arrsize(f_b16a), 1},
+						{activeKext, f_b16b, r_b16b, arrsize(f_b16b), 2},
+					};
+					bool okb = LookupPatchPlus::applyAll(patcher, patchB16, address, size);
+					IOLog("XeNG BLIT16: blit3d PS só SIMD16: %s\n", okb ? "aplicado" : "NAO encontrado");
+				}
+				if (!checkKernelArgument("-ngreenccs")) {
+					LookupPatchPlus const patchNoAux[] = {{activeKext, f_noaux, r_noaux, arrsize(f_noaux), 1}};
+					bool oka = LookupPatchPlus::applyAll(patcher, patchNoAux, address, size);
+					IOLog("XeNG NOAUX: fillSurfaceStateAuxInfo sempre AUX_NONE: %s\n", oka ? "aplicado" : "NAO encontrado");
+				}
+				// xe/rcpolicy (21/10, from WhateverXe jkbuha 1a9b960/76a9459): IntelAccelerator+0x1474 is the display/IOSurface
+				// "renderCompression" policy. start() leaves it 0 on real hardware (it is 1 only in the simulator), but the TGL
+				// FB's setDisplayMode calls callPlatformFunction("renderCompression", !hasExternalDisplay()) when the YTiling
+				// feature is on (FeatureControl YTiling=1 here) -> 1 with the internal panel only. XE-NOCCS's properties do not
+				// touch it. With 1: calculateIOSurfaceDeviceCacheVRAMBytes reserves CCS space for IOSurfaces, flips may keep a
+				// compressed scanout and generateFlip may set PLANE_CTL bit 15 (render decompression) although AUX is forced
+				// NONE (XE-NOAUX) and the resolves are stubbed (NOCCS3/NODEPTH). With 0 the accelerator runs Apple's
+				// "external display connected" path: every flip goes through disableRenderCompression first.
+				// Startup immediate (0x246e0) 1->0 and the setter (0x2b872) "mov al,[r15]" -> "mov al,0; nop".
+				// -ngreennorc disables.
+				if (xeFixEnabled() && !checkKernelArgument("-ngreennorc")) {
+					static const uint8_t f_rcstart[] = {0x41, 0xf6, 0x06, 0x20, 0x74, 0x08, 0x41, 0xc6, 0x85, 0x74, 0x14, 0x00, 0x00, 0x01};
+					static const uint8_t r_rcstart[] = {0x41, 0xf6, 0x06, 0x20, 0x74, 0x08, 0x41, 0xc6, 0x85, 0x74, 0x14, 0x00, 0x00, 0x00};
+					static const uint8_t f_rcset[] = {0x41, 0x8a, 0x07, 0x41, 0x88, 0x86, 0x74, 0x14, 0x00, 0x00, 0xeb, 0x16};
+					static const uint8_t r_rcset[] = {0xb0, 0x00, 0x90, 0x41, 0x88, 0x86, 0x74, 0x14, 0x00, 0x00, 0xeb, 0x16};
+					LookupPatchPlus const patchRcStart[] = {{activeKext, f_rcstart, r_rcstart, arrsize(f_rcstart), 1}};
+					LookupPatchPlus const patchRcSet[] = {{activeKext, f_rcset, r_rcset, arrsize(f_rcset), 1}};
+					bool oks = LookupPatchPlus::applyAll(patcher, patchRcStart, address, size);
+					if (!oks) patcher.clearError();
+					bool okr = LookupPatchPlus::applyAll(patcher, patchRcSet, address, size);
+					if (!okr) patcher.clearError();
+					IOLog("XeNG RCPOLICY: renderCompression (accel+0x1474) sempre 0: start %s, setter %s\n",
+						  oks ? "aplicado" : "NAO encontrado", okr ? "aplicado" : "NAO encontrado");
+				}
+				// xe/ffdop + xe/objpreempt (21/10, opt-in; WhateverXe r145/r135): IntelAccelerator::startGraphicsEngine writes
+				// CS_DEBUG_MODE1 (0x20ec) = 0x10001 and feeds the same EDX into CS_CHICKEN1 (0x2580). Our V163/V164 already
+				// clear FF_SLICE_CS_CHICKEN1 bit 14, so 3D object-level preemption is selected by 0x20ec bit 0 (=1 today).
+				//   -ngreenffdop        : also set 0x20ec bit 1 FF_DOP_CLOCK_GATE_DISABLE (Linux Wa_1606700617 tgl/dg1/adl-p).
+				//   -ngreenobjpoff: clear bit 0 in 0x20ec and 0x2580 (object-level preemption off; WEX TGL-B0 erratum).
+				// Window at 0x25166 (16.0.32): "mov edx,[rax+0x20ec]; mov edx,0x10001; mov [rax+0x20ec],edx" becomes
+				// "mov edx,<20ec>; mov [rax+0x20ec],edx; mov edx,<2580 bits>; nop" (the discarded MMIO read goes away).
+				{
+					bool ffdop = checkKernelArgument("-ngreenffdop");
+					bool objoff = checkKernelArgument("-ngreenobjpoff");
+					if (ffdop || objoff) {
+						uint8_t v20ec = (ffdop ? 0x02 : 0x00) | (objoff ? 0x00 : 0x01);
+						uint8_t m20ec = 0x01 | (ffdop ? 0x02 : 0x00);
+						uint8_t v2580 = objoff ? 0x00 : 0x01;
+						static const uint8_t f_preempt[] = {0x8b, 0x90, 0xec, 0x20, 0x00, 0x00, 0xba, 0x01, 0x00, 0x01, 0x00,
+						                                    0x89, 0x90, 0xec, 0x20, 0x00, 0x00};
+						uint8_t r_preempt[] = {0xba, v20ec, 0x00, m20ec, 0x00, 0x89, 0x90, 0xec, 0x20, 0x00, 0x00,
+						                       0xba, v2580, 0x00, 0x01, 0x00, 0x90};
+						static_assert(sizeof(r_preempt) == sizeof(f_preempt), "preempt patch size");
+						LookupPatchPlus const patchPreempt[] = {{activeKext, f_preempt, r_preempt, arrsize(f_preempt), 1}};
+						bool okp = LookupPatchPlus::applyAll(patcher, patchPreempt, address, size);
+						if (!okp) patcher.clearError();
+						IOLog("XeNG PREEMPT: 0x20ec=0x%02x%04x 0x2580|=0x1%04x (ffdop=%d objoff=%d): %s\n", m20ec, v20ec, v2580,
+							  ffdop, objoff, okp ? "aplicado" : "NAO encontrado");
+					}
+				}
 
 				// Optional secondary signature for Sonoma variants with long JE encoding.
 				/*LookupPatchPlus const patchRPLDevstartLong {
@@ -1761,9 +2893,22 @@ bool Gen11::paramsSurfCompare(AppleIntel::AppleIntelBaseController *that,
 	uint32_t nat_stride_pl2 = pl2 ? pl2->PLANE_STRIDE : 0;
 	uint32_t nat_surf_pl2   = pl2 ? pl2->PLANE_SURF   : 0;
 
-	if (!NGreen::callback->isRealTGL && pl2) {
-		pl2->PLANE_CTL    = (pl2->PLANE_CTL & ~(0x7u << 10));  // bits[12:10] = 000 → linear
-		pl2->PLANE_STRIDE = 0xa0;                               // 2560×4 / 64 = 160 = 0xa0
+	if (!NGreen::callback->isRealTGL && pl2 && !xeFixEnabled()) {
+		// xe/xtile (-ngreenxtile): keep Apple's native X-tiled PLANE_CTL (V401 logs: bits[12:10]=001)
+		// and use the X-tile stride (pitch / 512 B). 2560 px -> 0x14, 3840 px -> 0x1e.
+		uint32_t srcW = p2 ? (((p2->PIPE_SRCSZ >> 16) & 0xFFFF) + 1) : 0;
+		if (checkKernelArgument("-ngreenxtile")) {
+			pl2->PLANE_STRIDE = (srcW >= 640 && srcW <= 8192) ? (srcW * 4 / 512) : 0x14;
+		} else {
+			pl2->PLANE_CTL    = (pl2->PLANE_CTL & ~(0x7u << 10));  // bits[12:10] = 000 → linear
+			// xe/nooted: linear stride (64-byte units) from the real pipe width; the original
+			// hardcoded 0xa0 only fits a 2560-px-wide panel (3840 px needs 0xf0).
+			pl2->PLANE_STRIDE = (srcW >= 640 && srcW <= 8192) ? (srcW * 4 / 64) : 0xa0;
+			// xe/stride (-ngreenstride=N): sobrescreve o stride linear, para medir o efeito na largura das bandas.
+			uint32_t strideOv = 0;
+			if (PE_parse_boot_argn("ngreenstride", &strideOv, sizeof(strideOv)) && strideOv)
+				pl2->PLANE_STRIDE = strideOv;
+		}
 	}
 
 	bool ret = FunctionCast(paramsSurfCompare, callback->oparamsSurfCompare)(that, p1, p2, pl1, pl2);
@@ -2574,8 +3719,240 @@ void Gen11::hwSetPowerWellStateDDI(AppleIntel::AppleIntelBaseController *that, b
 	FunctionCast(hwSetPowerWellStateDDI, callback->ohwSetPowerWellStateDDI)(that,param_1,param_2);
 }
 
+
+// xe/xefix (-ngreenxefix, 2026-10-17): correção do display 13 (ADL-P/RPL-P) provada por CRC do plano:
+//  - o FB da Apple é X-tiled; no display 13 superfícies tiled passam pela DPT -> desligar com CHICKEN_MISC_2
+//    (0x42084) bit 30 (i915 intel_dpt_configure) para o plano X-tiled ler pela GGTT, como no TGL;
+//  - o driver TGL desliga a fatia S1 do DBUF (DBUF_CTL_S1 0x44FE8); sem ela a leitura do plano vira ruído
+//    -> manter o pedido de energia (bit 31) sempre ligado.
+static bool xeFixEnabled() {
+	static int v = -1;
+	if (v < 0) v = checkKernelArgument("-ngreenxefix") ? 1 : 0;
+	return v == 1;
+}
+// 20/10 (XE-NODPMS): a tela não acordava depois do repouso. Diagnóstico com XeShim (~/xe/tools/xe-sleep-diag.sh):
+// ao dormir o FB TGL desliga pipe A (TRANSCONF 0x70008), TRANS_DDI_FUNC_CTL_A (0x60400), DDI_BUF_CTL_A (0x64000),
+// o escalador (PS_CTRL_1A 0x68180), backlight e energia do painel; ao acordar religa painel e plano, mas NUNCA o
+// caminho pipe/transcoder/DDI (no boot ele herda a tela acesa pelo firmware, -ngreenkeepefi, e não sabe treinar o
+// link eDP no display 13). Aqui o caminho de vídeo do painel nunca é desmontado: escritas que limpam o bit de enable
+// desses registradores (e do clock da DDI-A em DPCLKA_CFGCR0, e da energia do painel em PP_CONTROL) são trocadas pelo
+// último valor ligado. A luz de fundo segue apagando (o painel fica escuro). -ngreendpms volta ao comportamento original.
+// v2 (20/10 20h): a v1 tinha IOLog aqui e também segurava o clock da DDI-A (DPCLKA_CFGCR0) -> spinlock timeout e
+// "lock recursively" no boot. v2: sem log, sem DPCLKA; só bloqueia depois de ver o registrador ligado.
+static uint32_t xeNoDpms(uint32_t r, uint32_t val) {
+	// 20/10 20h: DESLIGADO por padrão. Bloquear o desligamento do pipe também quebra as trocas de modo do FB (ele
+	// desliga o pipe e espera o hardware confirmar com uma trava segurada -> NMIPI/spinlock timeout no boot).
+	// Fica opt-in (-ngreennodpms) até o bloqueio ficar restrito ao caminho de repouso (hook de energia do FB).
+	static int on = -1;
+	if (on < 0) on = checkKernelArgument("-ngreennodpms") ? 1 : 0;
+	if (!on) return val;
+	static uint32_t lastOn[6];
+	int idx; uint32_t bit;
+	switch (r) {
+		case 0x70008:  idx = 0; bit = 0x80000000u; break;   // TRANSCONF_A
+		case 0x60400:  idx = 1; bit = 0x80000000u; break;   // TRANS_DDI_FUNC_CTL_A
+		case 0x64000:  idx = 2; bit = 0x80000000u; break;   // DDI_BUF_CTL_A
+		case 0x68180:  idx = 3; bit = 0x80000000u; break;   // PS_CTRL_1A
+		case 0xC7204:  idx = 4; bit = 0x00000001u; break;   // PP_CONTROL: power on
+		default: return val;
+	}
+	if (val & bit) { lastOn[idx] = val; return val; }
+	if (!lastOn[idx]) return val;          // nunca vimos ligado: não inventa valor
+	gXeDpmsBlocked++;   // sem IOLog: este filtro roda dentro de seções travadas do FB (log aqui = deadlock/spinlock timeout)
+	return r == 0xC7204 ? (val | 1u) : lastOn[idx];   // painel: só força o power on, o resto (backlight) passa
+}
+// xe/bootbar (21/10). XE-BOOTDIAG (só log, limitado): anel com as escritas da Apple no plano A, FBC, PSR, PIPE_SRCSZ
+// e DC_STATE_EN (sem log no caminho de escrita: pode ser contexto de interrupção), impresso com um retrato dos
+// registradores e do console do kernel antes/depois do FBController::start, em cada setDisplayMode e em +10/+40 s.
+// XE-BOOTHOLD: no boot o plano A varre o buffer linear 1024x768 da GOP em GGTT 0 (SURF=0). No 1º modo (~t=20.7 s) a
+// Apple grava PLANE_CTL X-tiled, STRIDE 0x1e, SIZE/PIPESRC 3840x2400 mas mantém SURF=0 por ~1 s até ter o buffer
+// próprio (SURF=0x45beb000 em t=21.69) -> a tela mostra o buffer de boot lido como X-tiled 3840x2400 (flash de lixo
+// em colunas). Enquanto SURF ainda é 0 e a Apple pede CTL tiled, o plano fica DESLIGADO (tela preta); na 1ª SURF != 0
+// v3 (bootbar4): espera a SURF voltar a um buffer já visto (anel do WindowServer deu a volta); timeout de 500 ms após a 1ª.
+// Grava-se o CTL real antes da SURF (que arma os dois). -xenobb desliga.
+static volatile SInt32 gXeBhDone = 0, gXeBhHolding = 0, gXeBhOn = -1;
+static volatile UInt32 gXeBhCtl = 0, gXeBhFirst = 0;
+static volatile UInt32 gXeBhBlc = 0; static uint64_t gXeBhFirstNs = 0; static int gXeBhMinMs = 600, gXeBhMaxMs = 1500;
+struct XeBdEnt { uint64_t ns; uint32_t reg, val, old; };
+static XeBdEnt gXeBd[256];
+static volatile SInt32 gXeBdN = 0, gXeBdPrinted = 0;
+static bool xeBdWatched(uint32_t r) {
+	switch (r) {
+		case 0x43200: case 0x43208: case 0x43224: case 0x45000: case 0x4208c:         // FBC: CFB base, DPFC_CTL, chicken, chicken par
+		case 0x70180: case 0x70188: case 0x7018C: case 0x70190: case 0x7019C: case 0x701A4:  // plane A CTL/STRIDE/POS/SIZE/SURF/OFFSET
+		case 0x6001C: case 0x60800: case 0x60900:                                     // PIPE_SRCSZ, PSR1/PSR2 CTL
+		case 0x45504:                                                                 // DC_STATE_EN
+			return true;
+	}
+	return false;
+}
+static void xeBootDiagRecord(unsigned long reg, uint32_t val) {
+	uint32_t r = (uint32_t)(reg & 0xFFFFF);
+	if (!xeBdWatched(r)) return;
+	SInt32 i = OSIncrementAtomic((volatile SInt32 *)&gXeBdN);
+	if (i >= (SInt32)arrsize(gXeBd)) return;
+	uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	gXeBd[i].ns = ns; gXeBd[i].reg = r; gXeBd[i].val = val;
+	gXeBd[i].old = NGreen::callback ? NGreen::callback->readReg32(r) : 0xFFFFFFFF;
+}
+static void xeBootDiagDump(const char *tag) {
+	if (!NGreen::callback) return;
+	static int dumps = 0;
+	if (dumps++ >= 12) return;
+	uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	PE_Video v {};
+	IOPlatformExpert *pe = OSDynamicCast(IOPlatformExpert, IOService::getPlatform());
+	bool hv = pe && pe->getConsoleInfo(&v) == kIOReturnSuccess;
+	#define R(a) NGreen::callback->readReg32(a)
+	IOLog("XeNG BOOTDIAG %s t=%llu.%03llu console=%d base=0x%lx rowBytes=%lu %lux%lu depth=%lu disp=%lu\n", tag,
+		  ns / 1000000000ULL, (ns / 1000000ULL) % 1000ULL, (int)hv, (unsigned long)v.v_baseAddr, (unsigned long)v.v_rowBytes,
+		  (unsigned long)v.v_width, (unsigned long)v.v_height, (unsigned long)v.v_depth, (unsigned long)v.v_display);
+	IOLog("XeNG BOOTDIAG %s PLANE_A CTL=%08x STRIDE=%08x POS=%08x SIZE=%08x SURF=%08x SURFLIVE=%08x OFF=%08x SRCSZ=%08x CUR=%08x/%08x\n", tag,
+		  R(0x70180), R(0x70188), R(0x7018C), R(0x70190), R(0x7019C), R(0x701AC), R(0x701A4), R(0x6001C), R(0x70080), R(0x70084));
+	IOLog("XeNG BOOTDIAG %s FBC CTL=%08x CFB=%08x CHICKEN=%08x STATUS=%08x/%08x PAR1=%08x 4208c=%08x PSR=%08x PSR2=%08x DC=%08x CDCLK_CTL=%08x DE_PLL=%08x\n", tag,
+		  R(0x43208), R(0x43200), R(0x43224), R(0x43210), R(0x43214), R(0x45000), R(0x4208c), R(0x60800), R(0x60900), R(0x45504), R(0x46000), R(0x46070));
+	for (int f = 0; f < 32; f++) {   // fences (aperture detiling used by CPU writes to tiled surfaces)
+		uint32_t lo = R(0x100000 + 8 * f), hi = R(0x100004 + 8 * f);
+		if (lo & 1) IOLog("XeNG BOOTDIAG %s FENCE%d lo=%08x hi=%08x\n", tag, f, lo, hi);
+	}
+	#undef R
+	SInt32 n = gXeBdN; if (n > (SInt32)arrsize(gXeBd)) n = arrsize(gXeBd);
+	for (SInt32 i = gXeBdPrinted; i < n; i++)
+		IOLog("XeNG BOOTDIAG w#%d t=%llu.%03llu reg=%05x val=%08x (was %08x)\n", (int)i, gXeBd[i].ns / 1000000000ULL,
+			  (gXeBd[i].ns / 1000000ULL) % 1000ULL, gXeBd[i].reg, gXeBd[i].val, gXeBd[i].old);
+	gXeBdPrinted = n;
+	IOLog("XeNG BOOTDIAG %s boothold blc0=%08x min=%d max=%d on=%d holding=%d done=%d ctl=%08x first=%08x\n", tag, (unsigned)gXeBhBlc, gXeBhMinMs, gXeBhMaxMs, (int)gXeBhOn, (int)gXeBhHolding, (int)gXeBhDone, (unsigned)gXeBhCtl, (unsigned)gXeBhFirst);
+	if (gXeBdN > (SInt32)arrsize(gXeBd)) IOLog("XeNG BOOTDIAG %s ring full (%d writes)\n", tag, (int)gXeBdN);
+}
+
+static thread_call_t gXeBhTimer = nullptr;
+static void xeBootHoldRelease(const char *why) {   // write Apple's last CTL, re-arm with the current SURF, backlight back on
+	if (gXeBhDone) return;
+	gXeBhDone = 1;
+	if (gXeBhHolding && NGreen::callback) {
+		NGreen::callback->writeReg32(0x70180, gXeBhCtl);
+		if (why) NGreen::callback->writeReg32(0x7019C, NGreen::callback->readReg32(0x7019C));
+		if (gXeBhBlc & 0x80000000u) NGreen::callback->writeReg32(0xC8250, NGreen::callback->readReg32(0xC8250) | 0x80000000u);
+	}
+	gXeBhHolding = 0;
+}
+static void xeBootHoldInit() {   // thread context (FBController::start): timer for the safety release
+	if (!gXeBhTimer) gXeBhTimer = thread_call_allocate([](thread_call_param_t, thread_call_param_t) {
+		if (!gXeBhDone) { xeBootHoldRelease("timeout"); IOLog("XeNG BOOTHOLD: released by timeout %d ms (first SURF 0x%x)\n", gXeBhMaxMs, (unsigned)gXeBhFirst); }
+	}, nullptr);
+}
+// XE-BOOTHOLD v4 (bootbar5): as v3, plus backlight (BLC_PWM_PCH_CTL1 0xC8250 bit 31) off during the hold and release
+// only after the ring wrapped AND >= xebbms (default 600) ms since the first surface; timeout xebbms+900 ms.
+// v3: the first show of EACH buffer of WindowServer's ring is unrendered (garbage), so the plane stays off
+// until a SURF returns to a buffer already shown (ring wrapped); 500 ms after the first non-zero SURF it is released anyway.
+static uint32_t xeBootHold(unsigned long reg, uint32_t val) {
+	if (gXeBhDone) return val;
+	uint32_t r = (uint32_t)(reg & 0xFFFFF);
+	if (r == 0xC8250) {   // Apple re-enabling the backlight during the hold: remember it, keep it off until release
+		if (gXeBhHolding) { gXeBhBlc = val; return val & ~0x80000000u; }
+		return val;
+	}
+	if (r != 0x70180 && r != 0x7019C) return val;
+	if (gXeBhOn < 0) gXeBhOn = checkKernelArgument("-xenobb") ? 0 : 1;
+	if (!gXeBhOn || !NGreen::callback) { gXeBhDone = 1; return val; }
+	if (r == 0x70180) {
+		if (!(val & 0x80000000u)) return val;
+		bool start = !gXeBhHolding && NGreen::callback->readReg32(0x7019C) == 0 && (val & (0x7u << 10));  // tiled CTL on the boot buffer
+		if (start) {   // v4: also switch the backlight off for the whole hold (hides anything not coming from plane A)
+			PE_parse_boot_argn("xebbms", &gXeBhMinMs, sizeof(gXeBhMinMs));
+			if (gXeBhMinMs < 0 || gXeBhMinMs > 5000) gXeBhMinMs = 600;
+			gXeBhMaxMs = gXeBhMinMs + 900;
+			gXeBhBlc = NGreen::callback->readReg32(0xC8250);
+			if (gXeBhBlc & 0x80000000u) NGreen::callback->writeReg32(0xC8250, gXeBhBlc & ~0x80000000u);
+		}
+		if (start || gXeBhHolding) { gXeBhCtl = val; gXeBhHolding = 1; return val & ~0x80000000u; }
+		return val;
+	}
+	if (val == 0) return val;
+	if (!gXeBhHolding) { gXeBhDone = 1; return val; }               // never held: nothing to do
+	static uint32_t seen[8], nseen = 0, last = 0;
+	if (!gXeBhFirst) {                                              // first real surface: keep off, start the safety timer
+		gXeBhFirst = val; absolutetime_to_nanoseconds(mach_absolute_time(), &gXeBhFirstNs);
+		if (gXeBhTimer) { uint64_t d; clock_interval_to_deadline(gXeBhMaxMs, kMillisecondScale, &d); thread_call_enter_delayed(gXeBhTimer, d); }
+	}
+	if (val == last) return val;                                    // same buffer re-armed in the same flip
+	last = val;
+	for (uint32_t k = 0; k < nseen; k++)
+		if (seen[k] == val) {   // ring wrapped (every buffer rendered once) AND >= xebbms since the first surface
+			uint64_t now = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+			if (now - gXeBhFirstNs >= (uint64_t)gXeBhMinMs * 1000000ULL) xeBootHoldRelease(nullptr);   // CTL first, this SURF arms both
+			return val;
+		}
+	if (nseen < 8) seen[nseen++] = val;
+	return val;
+}
+static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
+	xeBootDiagRecord(reg, val);
+	val = xeBootHold(reg, val);
+	if (!xeFixEnabled()) return val;
+	val = xeNoDpms((uint32_t)(reg & 0x1FFFFF), val);
+	// 20/10 (XE-BLR): o brilho ia só até ~50%. Como o BacklightRegistersFix do WhateverGreen: mantém o período do
+	// hardware (lido antes da 1ª escrita da Apple) e reescala o duty por período_hw / período_Apple. Se a Apple não
+	// gravar o período, ngreenblmax=N diz qual duty ela considera 100%. -ngreennoblr desliga.
+	{
+		uint32_t r = (uint32_t)(reg & 0xFFFFF);
+		if (r == 0xC8254 || r == 0xC8258) {
+			static int blr = -1, blmax = 0;
+			if (blr < 0) { blr = checkKernelArgument("-ngreennoblr") ? 0 : 1; PE_parse_boot_argn("ngreenblmax", &blmax, sizeof(blmax)); }
+			if (!gBlHwFreq && NGreen::callback) gBlHwFreq = NGreen::callback->readReg32(0xC8254);
+			if (r == 0xC8254) {
+				gBlFreqWrites++;
+				if (val) gBlAppleFreq = val;
+				if (blr == 1 && gBlHwFreq && gBlHwFreq != 0xFFFFFFFF) val = gBlHwFreq;
+			} else {
+				gBlLastDuty = val;
+				if (val > gBlMaxDuty) gBlMaxDuty = val;
+				uint32_t ref = blmax > 0 ? (uint32_t)blmax : gBlAppleFreq;
+				if (blr == 1 && ref && gBlHwFreq && gBlHwFreq != 0xFFFFFFFF && ref != gBlHwFreq) {
+					uint64_t v = (uint64_t)val * gBlHwFreq / ref;
+					val = v > gBlHwFreq ? gBlHwFreq : (uint32_t)v;
+				}
+				gBlLastOut = val;
+			}
+		}
+	}
+	switch (reg & 0xFFFFF) {
+		case 0x44FE8: if (!(val & 0x80000000u)) { static int n = 0; if (n++ < 8) IOLog("XeNG xefix: DBUF_CTL_S1 0x%x -> power on\n", val); } return val | 0x80000000u;
+		case 0x42084: return val | 0x40000000u;
+		// GAMMA_MODE_A: o driver TGL liga gamma pós-CSC de 10 bits com tabela no formato errado para o
+		// display 13 -> texto/cores degradados. Provado ao vivo (17/10 20h): com 0 (bypass) a imagem fica certa.
+		case 0x4A480: return 0;
+	}
+	return val;
+}
+// xe/inert: descarta escritas de Apple nos blocos dos engines (RCS 0x2000-0x2FFF, BCS 0x22000-0x22FFF, VDBOX/VEBOX 0x1C0000-0x1CFFFF)
+// quando -ngreenengineinert esta ligado; display (0x6xxxx/0x7xxxx) nao e afetado.
+static bool xeEngineInertOn() {
+	static int v = -1;
+	if (v < 0) v = checkKernelArgument("-ngreenengineinert") ? 1 : 0;
+	return v == 1;
+}
+static bool xeInertDrop(unsigned long reg) {
+	if (!xeEngineInertOn()) return false;
+	unsigned long r = reg & 0xFFFFFF;
+	bool eng = (r >= 0x2000 && r <= 0x2FFF) || (r >= 0x22000 && r <= 0x22FFF) || (r >= 0x1C0000 && r <= 0x1CFFFF);
+	if (eng) { static int n = 0; if (n++ < 24) IOLog("XeNG inert: escrita descartada reg=0x%lx\n", r); }
+	return eng;
+}
+static void xeFixEnsure() {
+	if (!xeFixEnabled() || !NGreen::callback) return;
+	uint32_t ck = NGreen::callback->readReg32(0x42084);
+	if (!(ck & 0x40000000u)) NGreen::callback->writeReg32(0x42084, ck | 0x40000000u);
+	if (NGreen::callback->readReg32(0x4A480) != 0) NGreen::callback->writeReg32(0x4A480, 0);
+	uint32_t s1 = NGreen::callback->readReg32(0x44FE8);
+	if (!(s1 & 0x80000000u)) NGreen::callback->writeReg32(0x44FE8, s1 | 0x80000000u | 0x40c000u);
+	static int n = 0; if (n++ < 4) IOLog("XeNG xefix: ensure CK=0x%x S1=0x%x\n", NGreen::callback->readReg32(0x42084), NGreen::callback->readReg32(0x44FE8));
+}
 void Gen11::FastWriteRegister32(AppleIntel::AppleIntelBaseController *that, unsigned long param_1, uint32_t param_2)
 {
+	if (xeInertDrop(param_1)) return;
+	param_2 = xeFixFilterWrite(param_1, param_2);
+	if ((param_1 & 0xFFFFF) == 0x7019C) xeFixEnsure();
 	// V99D: Diagnose — log all FastWrite calls near display engine range on first boot
 	// to understand what addresses/values flow through this path.
 	{
@@ -2667,6 +4044,7 @@ void Gen11::FastWriteRegister32(AppleIntel::AppleIntelBaseController *that, unsi
 
 void Gen11::raWriteRegister32b(void *that,void *param_1,unsigned long param_2, UInt32 param_3)
 {
+	if (xeInertDrop(param_2)) return;
 	//if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return;
 	//if (reinterpret_cast<volatile uint64_t*>(param_1)==nullptr) return;
 	raWriteRegister32(that, reinterpret_cast<uint64_t>(param_1) + param_2,param_3);
@@ -2674,6 +4052,9 @@ void Gen11::raWriteRegister32b(void *that,void *param_1,unsigned long param_2, U
 
 void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 {
+	if (xeInertDrop(param_1)) return;
+	param_2 = xeFixFilterWrite(param_1, param_2);
+	if ((param_1 & 0xFFFFF) == 0x7019C) xeFixEnsure();
 	// V93: optional plane SURF zero-write guard.
 	// Disabled by default due black-screen regressions; enable only with -ngreenv93.
 	struct V93PlaneSurfState {
@@ -2762,6 +4143,14 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 	// have their own PLANE_STRIDE rewrites — to fully test, those need removal too.
 	// For now keep the address-match shell so future legitimate intercepts can use it.
 	if ((param_1 & 0xFFFFF) == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
+		// xe/stride: override no caminho MMIO (o que realmente chega ao hardware). A escrita na struct do plano não chega.
+		uint32_t strideOv = 0;
+		uint32_t strideIn = param_2;
+		if (PE_parse_boot_argn("ngreenstride", &strideOv, sizeof(strideOv)) && strideOv)
+			param_2 = strideOv;
+		static int strideLogs = 0;
+		if (strideLogs++ < 20)
+			IOLog("XeNG STRIDE[%d] in=0x%x out=0x%x ov=0x%x\n", strideLogs, strideIn, param_2, strideOv);
 		static int v99SPassCount = 0;
 		if (v99SPassCount < 3) {
 			++v99SPassCount;
@@ -2909,7 +4298,7 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 				#undef R
 			}
 		}
-		/*.  ------ MAN IN THE MIDDLE CHIP HACK -------
+		// ------ MAN IN THE MIDDLE CHIP HACK ------- (V99R/V99G ativo: teste xtile2)
 		// V99R[P] + V99G + linear CTL/STRIDE forces — CORE scanout coherence (!isRealTGL).
 		// Confirmed load-bearing for visible scanout on spoofed RPL/ADL-P in dp0, dp1, AND
 		// without any -ngreendp* boot arg. Real TGL hardware programs these correctly via
@@ -2933,7 +4322,18 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		//      confirmed empirically. Side effect: produces the fragmented/repeated
 		//      pattern when Apple's allocator stores buffer in non-linear physical layout
 		//      — known cost of this path, removable only by struct-level fix.
-		if (NGreen::callback && !NGreen::callback->isRealTGL && param_2 >= 0x10000000u) {
+		// xe (19/10): com -ngreenxefix o V99R/V99G fica desligado (religar com -ngreenv99g). Os slots fixos de 4000
+		// páginas (feitos para 2560x1600) só cobriam 16 MB dos 36,9 MB de 3840x2400: o resto da tela lia a memória
+		// stolen (glitch embaixo), e o slot 0 (GGTT[0..3999]) pisava no LRCA do contexto em GGTT 0x18000.
+		// Sem o desvio, o plano lê a superfície que o driver da Apple aponta (GGTT já mapeada por ele).
+		static int v99Arg = -1;  // sem guard variable no kernel: calcula uma vez na mão
+		if (v99Arg < 0) v99Arg = (checkKernelArgument("-ngreenv99g") || !checkKernelArgument("-ngreenxefix")) ? 1 : 0;
+		const bool v99On = v99Arg == 1;
+		if (!v99On && param_2 >= 0x10000000u) {
+			static int v99OffCount = 0;
+			if (v99OffCount < 4) IOLog("XeNG V99 off: SURF 0x%x direto\n", (uint32_t)param_2), ++v99OffCount;
+		}
+		if (v99On && NGreen::callback && !NGreen::callback->isRealTGL && param_2 >= 0x10000000u) {
 			static int v99PCount = 0;
 			if (v99PCount < 8)
 				SYSLOG("ngreen", "V99R[P%d]: SURF 0x%x->aperture (non-aperture redirect)",
@@ -2982,11 +4382,11 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 			// Remap GGTT[slot*4000 .. slot*4000+3999] from srcPage..srcPage+3999.
 			{
 				int base = slot * 4000;
-				int remapped = 0, remapSkipped = 0;
+				int remapped = 0, remapSkipped = 0, firstSkip = -1, lastSkip = -1;
 				for (int i = 0; i < 4000; i++) {
 					uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(srcPage + i));
 					uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(srcPage + i));
-					if (!(lo & 1)) { remapSkipped++; continue; }
+					if (!(lo & 1)) { if (remapSkipped == 0) firstSkip = i; lastSkip = i; remapSkipped++; continue; }
 					NGreen::callback->writeReg32(GGTT_PTE_LO(base + i), lo);
 					NGreen::callback->writeReg32(GGTT_PTE_HI(base + i), hi);
 					remapped++;
@@ -2995,6 +4395,10 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 				if (++v99GCount <= 8 || (v99GCount & 0x3F) == 0)
 					SYSLOG("ngreen", "V99G[%d]: GGTT[%d..%d] <- srcPage=0x%x slot=%d remapped=%d skip=%d",
 						   v99GCount, base, base + 3999, srcPage, slot, remapped, remapSkipped);
+					// xe/diag: IOLog reaches the kernel log (SYSLOG does not reach the unified log).
+					if (v99GCount <= 16 || (v99GCount & 0x3F) == 0)
+						IOLog("XeNG V99G[%d] slot=%d srcPage=0x%x remapped=%d skip=%d firstSkip=%d lastSkip=%d\n",
+							  v99GCount, slot, srcPage, remapped, remapSkipped, firstSkip, lastSkip);
 			}
 
 			// Redirect SURF to the aperture address of the assigned slot.
@@ -3010,6 +4414,7 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		// (V99R[P]+V99G handle the SURF redirect / GGTT remap unconditionally).
 		//
 		// Gated on !isRealTGL. Real TGL programs natively.
+		/* linear forces com STRIDE=0xa0 (2560 px) ficam desligados: o paramsSurfCompare já força linear com stride do modo real.
 		if (NGreen::callback && !NGreen::callback->isRealTGL) {
 			// force CTL linear and STRIDE=0xa0 (CPU compositor writes linearly via BAR2).
 			uint32_t hwTiling = (hwCtl >> 10) & 0x7;
@@ -3152,6 +4557,8 @@ int Gen11::handleLinkIntegrityCheck()
 void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 {
 	SYSLOG("ngreen", "NB-BUILD-V50-ALLOW-METAL");
+
+	xeFwSnapshot();   // XE-FWSNAP: antes de qualquer escrita nossa ou da Apple
 
 	int origB48 = getMember<int>(that, 0xB48);
 	int origCE4 = getMember<int>(that, 0xCE4);
@@ -3336,27 +4743,39 @@ void Gen11::hwInitializeCState(AppleIntel::AppleIntelBaseController *that)
 		// Pre-matches Apple's target so paramsFbCompare sees no lane-count change; changing
 		// lane count in TRANS_DDI_FUNC_CTL while transcoder is live resets the DDI buffer
 		// and drops the trained link.
-		NGreen::callback->writeReg32(0x60400, 0x8A000106); // TRANS_DDI_FUNC_CTL_A
-		NGreen::callback->writeReg32(0x60000, 0x0A9F09FF); // TRANS_HTOTAL_A
-		NGreen::callback->writeReg32(0x60004, 0x0A9F09FF); // TRANS_HBLANK_A
-		NGreen::callback->writeReg32(0x60008, 0x0A4F0A2F); // TRANS_HSYNC_A
-		NGreen::callback->writeReg32(0x6000C, 0x06D5063F); // TRANS_VTOTAL_A
-		NGreen::callback->writeReg32(0x60010, 0x06D50000); // TRANS_VBLANK_A
-		NGreen::callback->writeReg32(0x60014, 0x06480642); // TRANS_VSYNC_A
-		NGreen::callback->writeReg32(0x60028, 0x00000000); // TRANS_VSYNCSHIFT_A
-		NGreen::callback->writeReg32(0x60030, 0x7E5D159E); // TRANS_DATA_M1_A  (TU 64, M=0x5d159e)
-		NGreen::callback->writeReg32(0x60034, 0x00800000); // TRANS_DATA_N1_A  (N=0x800000)
-		NGreen::callback->writeReg32(0x60040, 0x0007C1CD); // TRANS_LINK_M1_A  (M=0x7c1cd)
-		NGreen::callback->writeReg32(0x60044, 0x00080000); // TRANS_LINK_N1_A  (N=0x80000)
+		// xe/nooted: the values below are a register dump of the author's 2560x1600, 2-lane eDP panel.
+		// On a different panel they replace the firmware-trained native mode (here 3840x2400, 4 lanes
+		// HBR3) and the panel goes black; Apple's FB then keeps them for the online boot display.
+		// -ngreenkeepefi: keep what UEFI/GOP programmed when transcoder A is already running.
+		const bool keepEfiTiming = checkKernelArgument("-ngreenkeepefi") &&
+			(NGreen::callback->readReg32(0x70008) & 0x80000000u);
+		if (keepEfiTiming) {
+			SYSLOG("ngreen", "keepefi: TRANS_DDI_FUNC_CTL_A=0x%x HTOTAL=0x%x VTOTAL=0x%x PP_CONTROL=0x%x kept",
+				   NGreen::callback->readReg32(0x60400), NGreen::callback->readReg32(0x60000),
+				   NGreen::callback->readReg32(0x6000C), NGreen::callback->readReg32(0xC7204));
+		} else {
+			NGreen::callback->writeReg32(0x60400, 0x8A000106); // TRANS_DDI_FUNC_CTL_A
+			NGreen::callback->writeReg32(0x60000, 0x0A9F09FF); // TRANS_HTOTAL_A
+			NGreen::callback->writeReg32(0x60004, 0x0A9F09FF); // TRANS_HBLANK_A
+			NGreen::callback->writeReg32(0x60008, 0x0A4F0A2F); // TRANS_HSYNC_A
+			NGreen::callback->writeReg32(0x6000C, 0x06D5063F); // TRANS_VTOTAL_A
+			NGreen::callback->writeReg32(0x60010, 0x06D50000); // TRANS_VBLANK_A
+			NGreen::callback->writeReg32(0x60014, 0x06480642); // TRANS_VSYNC_A
+			NGreen::callback->writeReg32(0x60028, 0x00000000); // TRANS_VSYNCSHIFT_A
+			NGreen::callback->writeReg32(0x60030, 0x7E5D159E); // TRANS_DATA_M1_A  (TU 64, M=0x5d159e)
+			NGreen::callback->writeReg32(0x60034, 0x00800000); // TRANS_DATA_N1_A  (N=0x800000)
+			NGreen::callback->writeReg32(0x60040, 0x0007C1CD); // TRANS_LINK_M1_A  (M=0x7c1cd)
+			NGreen::callback->writeReg32(0x60044, 0x00080000); // TRANS_LINK_N1_A  (N=0x80000)
 
-		// Panel power sequencer (re-imported from EFI reference).
-		// TGL/ADL-P both have PCH_SPLIT (ICP/TGP PCH) → intel_pps_setup sets
-		// mmio_base = PCH_PPS_BASE = 0xC7200 (not 0x61200 which is BXT/APL).
-		// Values from Linux intel_reg dump on this hardware:
-		//   0xC7204 (PP_CONTROL)   = 0x00000067 (panel on, VDD on, power-on target)
-		//   0xC7208 (PP_ON_DELAYS) = 0x07D00001 (T1=1, T3=2000ms power-on delays)
-		NGreen::callback->writeReg32(0xC7204, 0x00000067); // PP_CONTROL
-		NGreen::callback->writeReg32(0xC7208, 0x07D00001); // PP_ON_DELAYS
+			// Panel power sequencer (re-imported from EFI reference).
+			// TGL/ADL-P both have PCH_SPLIT (ICP/TGP PCH) → intel_pps_setup sets
+			// mmio_base = PCH_PPS_BASE = 0xC7200 (not 0x61200 which is BXT/APL).
+			// Values from Linux intel_reg dump on this hardware:
+			//   0xC7204 (PP_CONTROL)   = 0x00000067 (panel on, VDD on, power-on target)
+			//   0xC7208 (PP_ON_DELAYS) = 0x07D00001 (T1=1, T3=2000ms power-on delays)
+			NGreen::callback->writeReg32(0xC7204, 0x00000067); // PP_CONTROL
+			NGreen::callback->writeReg32(0xC7208, 0x07D00001); // PP_ON_DELAYS
+		}
 
 		// PIPE_CLK_SEL_A (0x46140 = 0x10000000) REMOVED after the EFI re-import caused
 		// "CD Clock PLL is locked" line to disappear from the FB log and link bitRates to
@@ -3492,7 +4911,8 @@ void NGreen::adlpDcExit(const char *caller) {
 	writeReg32(0x8F03C, 0xC003B300u);
 	writeReg32(0x8F00C, 0x571056C0u);
 	// 4. Restore panel power sequencer.
-	writeReg32(0xC7204, 0x67u);  // PP_CONTROL
+	// XE-FWSNAP (audit c4): 0x67 limpa o bit 3 (EDP_BLC_ENABLE), que o firmware do X1C liga (0x6f).
+	writeReg32(0xC7204, gXeFwPpControl ? gXeFwPpControl : 0x67u);  // PP_CONTROL
 	// 5. Disable PSR — DMC may have re-enabled it on DC exit.
 	writeReg32(0x60800, 0u);   // EDP_PSR_CTL (TGL)
 	writeReg32(0x60A10, 0u);   // EDP_PSR2_CTL (TGL)
@@ -3656,8 +5076,21 @@ bool Gen11::AppleIntelBaseControllerstart(AppleIntel::AppleIntelBaseController *
 	SYSLOG("ngreen", "AppleIntelBaseControllerstart: display workarounds applied");
 
 	SYSLOG("ngreen", "FBController::start() entering...");
+	xeBootHoldInit();
+	xeBootDiagDump("pre-FBstart");
 	auto ret=FunctionCast(AppleIntelBaseControllerstart, callback->oAppleIntelBaseControllerstart)(that,param_1 );
 	SYSLOG("ngreen", "FBController::start() returned %d", ret);
+	xeBootDiagDump("post-FBstart");
+	{   // again 10 s and 40 s later (thread context): writes made while the boot screen/progress bar were up and at the WindowServer handoff
+		static thread_call_t tc10 = nullptr, tc40 = nullptr;
+		if (!tc10) {
+			tc10 = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { xeBootDiagDump("t+10s"); }, nullptr);
+			tc40 = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { xeBootDiagDump("t+40s"); }, nullptr);
+			uint64_t d10, d40; clock_interval_to_deadline(10, kSecondScale, &d10); clock_interval_to_deadline(40, kSecondScale, &d40);
+			if (tc10) thread_call_enter_delayed(tc10, d10);
+			if (tc40) thread_call_enter_delayed(tc40, d40);
+		}
+	}
 	
 	if (ret) {
 		// The personality dict itself was registered in IOCatalogue from the HW-kext
@@ -3990,6 +5423,48 @@ unsigned long Gen11::start(void *that,void  *param_1)
 			newDevDict->release();
 		}
 	}
+	// xe/noccs (19/10): desliga a compressão de render (CCS) do Gen12. Com ngreenSched=4 o SecurityAgent
+	// panicou em resolve_ccs <- submitCCSResolve <- enableRenderCompressionWithAccelTask (AUX-TT não configurada no RPL).
+	// populateAccelConfig lê RenderCompressionMode (padrão 1) e AllowIOSurfaceRenderCompression via utilGetProperty:
+	// zera os dois no dicionário Development e no nível de cima do serviço.
+	{
+		auto *dd = OSDynamicCast(OSDictionary, service->getProperty("Development"));
+		auto *nd = dd ? OSDictionary::withDictionary(dd) : OSDictionary::withCapacity(4);
+		auto *zero = OSNumber::withNumber(0ULL, 32);
+		if (nd && zero) {
+			nd->setObject("RenderCompressionMode", zero);
+			nd->setObject("AllowIOSurfaceRenderCompression", zero);
+			service->setProperty("Development", nd);
+			service->setProperty("RenderCompressionMode", zero);
+			service->setProperty("AllowIOSurfaceRenderCompression", zero);
+			SYSLOG("ngreen", "XE-NOCCS: RenderCompressionMode=0 AllowIOSurfaceRenderCompression=0 injetados");
+		}
+		if (nd) nd->release();
+		if (zero) zero->release();
+	}
+	// xe/nogva (20/10): a personality TGL anuncia decodificador/escalador de vídeo por hardware (IOGVACodec/IOGVAScaler
+	// "Gen10", capacidades HEVC). No RPL o VTDecompressionSession de hardware falha (-12913) e qualquer sessão de
+	// software que peça formato de saída morre em -6680 (conversão pelo escalador GVA) -> YouTube "Ocorreu um erro".
+	// Provado com ~/xe/build/xe-vttest: software sem formato decodifica certo. Sem estas chaves o VideoToolbox usa
+	// decodificador e conversão por software. -ngreengva mantém o anúncio.
+	if (!checkKernelArgument("-ngreengva")) {
+		static const char *const gvaKeys[] = {"IOGVACodec", "IOGVAScaler", "IOGVABGRAEnc",
+		                                      "IOGVAHEVCDecodeCapabilities", "IOGVAHEVCEncodeCapabilities"};
+		for (auto *k : gvaKeys) service->removeProperty(k);
+		SYSLOG("ngreen", "XE-NOGVA: anúncio de vídeo por hardware (IOGVA*) removido");
+	} else {
+		// xe/gvaid (20/10): com o anúncio mantido, o AppleGVA recusava o plugin ("PluginConnect: Plugin ID not a match
+		// 1080040"): a personality TGL diz IOVARendererID 0x1080040, mas o AppleIntelTGLGraphicsVADriver se identifica
+		// como 0x1080080 (o ID do ICL; o driver TGL veio do código do ICL) e o AppleGVA só conhece esse. Anuncia 0x1080080.
+		auto *rid = OSNumber::withNumber(0x1080080ULL, 32);
+		if (rid) { service->setProperty("IOVARendererID", rid); rid->release(); }
+		SYSLOG("ngreen", "XE-GVAID: IOVARendererID = 0x1080080 (ID do AppleIntelTGLGraphicsVADriver)");
+		// xe/gvahevc (21/10): o AppleGVA só oferece HEVC por hardware se o acelerador tiver IOGVAHEVCDecode (o kext ICL
+		// do Tahoe traz "2" no Info.plist; a personality TGL só tem IOGVAHEVCDecodeCapabilities). Sem ela a sessão HEVC
+		// falha com -12906. Com o plugin VA corrigido (macos/vadriver), a decodificação HEVC sai idêntica à de software.
+		service->setProperty("IOGVAHEVCDecode", "2");
+		SYSLOG("ngreen", "XE-GVAHEVC: IOGVAHEVCDecode = \"2\"");
+	}
 	} else {
 		SYSLOG("ngreen", "V52: Real TGL — skipping MultiForceWakeSelect override");
 	}
@@ -4125,6 +5600,7 @@ unsigned long Gen11::start(void *that,void  *param_1)
 	
 	// V42: Save accelerator instance for child enumeration in hangcheck
 	callback->accelInstance = that;
+	xeRc6FwStart(that);  // xe/rc6fw (22/10)
 	
 	// V54: Pre-enable Master IRQ BEFORE calling original start().
 	// V53 proved that the TGL driver never enables GFX_MSTR_IRQ bit 31 on RPL.
@@ -4959,7 +6435,8 @@ void Gen11::getGPUInfo(void *that)
 	//   0x1150 = Frequency pair (low32=fMaxMHz, high32=fMinMHz)
 	//   0x1164 = L3BankCount
 	unsigned int numSlices        = 1;
-	unsigned int numSubSlices     = 12;  // 6 DSS × 2 = 12 traditional SS
+	xeTopoArgs();
+	unsigned int numSubSlices     = gTopoSs;  // 6 DSS × 2 = 12 traditional SS (xe/topo4: ngreen-eu / 8)
 	unsigned int maxEUPerSubSlice = 8;   // 16 EU/DSS ÷ 2 SS/DSS = 8 EU/SS
 	unsigned int totalEU          = maxEUPerSubSlice * numSubSlices; // = 96
 	
@@ -4969,13 +6446,20 @@ void Gen11::getGPUInfo(void *that)
 	getMember<UInt32>(that, 0x1124) = totalEU;
 	getMember<UInt32>(that, 0x0dd8) = numSlices;
 	getMember<UInt32>(that, 0x0ddc) = numSubSlices;
-	getMember<UInt32>(that, 0x1164) = 8;  // L3BankCount (confirmed from InsanelyMac TGL logs)
+	getMember<UInt32>(that, 0x1164) = gTopoL3;  // L3BankCount (8 confirmed from InsanelyMac TGL logs; xe/topo4: ngreen-l3)
 	
 	// Frequency: fMaxFrequencyInMhz=1000, fMinFrequencyInMhz=450 (TGL defaults)
 	getMember<uint64_t>(that, 0x1150) = 0x1C2000003E8ULL;
 	
-	SYSLOG("ngreen", "getGPUInfo: overridden topology → slices=%u subslices=%u maxEU/SS=%u totalEU=%u L3Banks=8",
-		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU);
+	SYSLOG("ngreen", "getGPUInfo: overridden topology → slices=%u subslices=%u maxEU/SS=%u totalEU=%u L3Banks=%u",
+		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU, gTopoL3);
+	IOLog("XeNG TOPO: subslices=%u eu/ss=%u eu=%u l3=%u%s\n", numSubSlices, maxEUPerSubSlice, totalEU, gTopoL3,
+	      (numSubSlices == 12 && gTopoL3 == 8) ? " (default)" : " (boot-arg)");
+	// published later from a thread_call, not from inside getGPUInfo
+	static thread_call_t tc = nullptr;
+	gTopoAcc = that;
+	if (!tc) tc = thread_call_allocate(xeTopoPublish, nullptr);
+	if (tc) thread_call_enter(tc);
 
 }
 
@@ -4989,6 +6473,57 @@ void Gen11::getGPUInfo(void *that)
 //
 // Fix: clear bit 14 BEFORE calling original so the snapshot captures 0x0000,
 // making the replay batch write 0x0000 to 0x20E0 on every context switch instead.
+// xe/lrca: reparo da pagina1 do LRCA (slot GGTT[0x19]) com diagnostico de PTE/readback.
+void Gen11::xeLrcaRepair(const char *tag)
+{
+	// V507 LRCA repair: re-copy the ring-LRI from the saved RCS context buffer to the
+	// ExecList submission slot (GGTT[0x19]) after every populateResetRegisterList.
+	// The display retry loop reuses the same context without calling withOptions again,
+	// so the slot gets wiped by stopGraphicsEngine and never repaired by V508.
+	auto *cb = NGreen::callback;
+	void *ctx = cb->lastRCSCtx;
+	if (!cb->isRealTGL && ctx) {
+		uint32_t lrcaGpuVa = getMember<uint32_t>(ctx, 0x89) & 0xFFFFF000;
+		if (lrcaGpuVa) {
+			uint32_t ctxPage1Idx = (lrcaGpuVa >> 12) + 1;
+			cb->setApertureIfNecessary();
+			if (cb->aperturePtr && cb->apertureLen >= 0x1000) {
+				uint32_t slotLo = cb->readReg32(GGTT_PTE_LO(0x19));
+				uint32_t slotHi = cb->readReg32(GGTT_PTE_HI(0x19));
+				uint32_t ctxLo  = cb->readReg32(GGTT_PTE_LO(ctxPage1Idx));
+				uint32_t ctxHi  = cb->readReg32(GGTT_PTE_HI(ctxPage1Idx));
+				if ((slotLo & 1) && (ctxLo & 1)) {
+					asm volatile("wbinvd" ::: "memory");
+					volatile uint32_t *ap = cb->aperturePtr;
+					uint32_t saveLo = cb->readReg32(GGTT_PTE_LO(0));
+					uint32_t saveHi = cb->readReg32(GGTT_PTE_HI(0));
+
+					uint32_t buf[96];
+					cb->writeReg32(GGTT_PTE_LO(0), ctxLo);
+					cb->writeReg32(GGTT_PTE_HI(0), ctxHi);
+					cb->writeReg32(0x101008, 0x1);
+					for (int i = 0; i < 96; i++) buf[i] = ap[i];
+
+					cb->writeReg32(GGTT_PTE_LO(0), slotLo);
+					cb->writeReg32(GGTT_PTE_HI(0), slotHi);
+					cb->writeReg32(0x101008, 0x1);
+
+					if ((ap[1] & 0x1F801000) != 0x11001000 &&
+					    (buf[1] & 0x1F801000) == 0x11001000) {
+						for (int i = 0; i < 96; i++) ap[i] = buf[i];
+						asm volatile("sfence" ::: "memory");
+						SYSLOG("ngreen", "XE-LRCA[%s]: repair slot<-ctx DW1=%08x slotPTE=%08x:%08x ctxPTE=%08x:%08x readback DW1=%08x", tag, buf[1], slotHi, slotLo, ctxHi, ctxLo, (uint32_t)ap[1]);
+					}
+
+					cb->writeReg32(GGTT_PTE_LO(0), saveLo);
+					cb->writeReg32(GGTT_PTE_HI(0), saveHi);
+					cb->writeReg32(0x101008, 0x1);
+				}
+			}
+		}
+	}
+}
+
 void Gen11::populateResetRegisterList(void *that)
 {
 	if (!NGreen::callback->isRealTGL) {
@@ -5076,53 +6611,7 @@ void Gen11::populateResetRegisterList(void *that)
 			rmPre, rmPost, !!(rmPost & (1u << 15)));
 	}
 
-	// V507 LRCA repair: re-copy the ring-LRI from the saved RCS context buffer to the
-	// ExecList submission slot (GGTT[0x19]) after every populateResetRegisterList.
-	// The display retry loop reuses the same context without calling withOptions again,
-	// so the slot gets wiped by stopGraphicsEngine and never repaired by V508.
-	auto *cb = NGreen::callback;
-	void *ctx = cb->lastRCSCtx;
-	if (!cb->isRealTGL && ctx) {
-		uint32_t lrcaGpuVa = getMember<uint32_t>(ctx, 0x89) & 0xFFFFF000;
-		if (lrcaGpuVa) {
-			uint32_t ctxPage1Idx = (lrcaGpuVa >> 12) + 1;
-			cb->setApertureIfNecessary();
-			if (cb->aperturePtr && cb->apertureLen >= 0x1000) {
-				uint32_t slotLo = cb->readReg32(GGTT_PTE_LO(0x19));
-				uint32_t slotHi = cb->readReg32(GGTT_PTE_HI(0x19));
-				uint32_t ctxLo  = cb->readReg32(GGTT_PTE_LO(ctxPage1Idx));
-				uint32_t ctxHi  = cb->readReg32(GGTT_PTE_HI(ctxPage1Idx));
-				if ((slotLo & 1) && (ctxLo & 1)) {
-					asm volatile("wbinvd" ::: "memory");
-					volatile uint32_t *ap = cb->aperturePtr;
-					uint32_t saveLo = cb->readReg32(GGTT_PTE_LO(0));
-					uint32_t saveHi = cb->readReg32(GGTT_PTE_HI(0));
-
-					uint32_t buf[96];
-					cb->writeReg32(GGTT_PTE_LO(0), ctxLo);
-					cb->writeReg32(GGTT_PTE_HI(0), ctxHi);
-					cb->writeReg32(0x101008, 0x1);
-					for (int i = 0; i < 96; i++) buf[i] = ap[i];
-
-					cb->writeReg32(GGTT_PTE_LO(0), slotLo);
-					cb->writeReg32(GGTT_PTE_HI(0), slotHi);
-					cb->writeReg32(0x101008, 0x1);
-
-					if ((ap[1] & 0x1F801000) != 0x11001000 &&
-					    (buf[1] & 0x1F801000) == 0x11001000) {
-						for (int i = 0; i < 96; i++) ap[i] = buf[i];
-						asm volatile("sfence" ::: "memory");
-						SYSLOG("ngreen", "V507: LRCA re-repair slot←ctx DW1=%08x",
-						       buf[1]);
-					}
-
-					cb->writeReg32(GGTT_PTE_LO(0), saveLo);
-					cb->writeReg32(GGTT_PTE_HI(0), saveHi);
-					cb->writeReg32(0x101008, 0x1);
-				}
-			}
-		}
-	}
+	xeLrcaRepair("resetRegList");
 }
 
 void *Gen11::createUserGPUTask(void *that)
@@ -5389,6 +6878,123 @@ void Gen11::blit3d_initialize_scratch_space(void *that)
 	FunctionCast(blit3d_initialize_scratch_space, callback->oblit3d_initialize_scratch_space)(that);
 }
 
+// 20/10 (XE-RESFREE): pânico "kfree: addr 0x300c000040001 ... not found in any zone" (pid Wallpaper) em
+// IGAccelResource::free+0x182: a tabela por plano/mip em this+0x250 (tamanho this+0x258, entradas de 40 bytes,
+// índice = i*[0xad]+j com i<[0xac], [0xae]<=j<[0xae]+[0xad]) tem ponteiros (entrada+0x20) inválidos no Tahoe.
+// Antes do free original: entradas fora da tabela -> não percorre (zera 0xac); ponteiros não mapeados -> zera
+// (vaza uns bytes em vez de panicar). -ngreennoresfree desliga.
+// 20/10 (XE-GTFREQ): IGHardwareCommandStreamer5::handleChangeFrequencyInterrupt pede a frequência ao objeto de
+// energia em accel+0xde8 (depende do GuC/SLPC, desligado com -disablegfxfirmware) e recebe 0 -> grava RPNSWREQ
+// (0xA008) = 0 e a GPU fica no RPn (100 MHz; RP0 do i7-1360P = 1500 MHz). Provado ao vivo: pedir 900 MHz com
+// forcewake sobe o CAGF na hora e a Apple zera em ~20 ms. Aqui o pedido nunca fica abaixo de ngreengtfreq (MHz,
+// padrão 1500 = RP0 desde 20/10 noite, antes 1100; 0 desliga). Ocioso a GPU entra em RC6 de qualquer jeito, então o piso só vale com trabalho.
+void Gen11::wrapSetGTFrequencyMMIO(void *that, uint32_t val)
+{
+	static int pisoMhz = -1;
+	if (pisoMhz < 0) {
+		pisoMhz = 1500;
+		PE_parse_boot_argn("ngreengtfreq", &pisoMhz, sizeof(pisoMhz));
+		if (pisoMhz > 1500) pisoMhz = 1500;
+	}
+	gXeGtFreqApple = val;
+	gXeGtFreqN++;
+	if (pisoMhz > 0) {
+		uint32_t ratio = (val & 0xf) ? ((val >> 14) & 0x1ff) : (val >> 23);  // mesmo decode da Apple
+		uint32_t piso = (uint32_t)pisoMhz * 3 / 50;                           // unidades de 16,67 MHz (Gen9+)
+		if (ratio < piso) val = piso << 23;
+	}
+	FunctionCast(wrapSetGTFrequencyMMIO, callback->oSetGTFrequencyMMIO)(that, val);
+}
+
+// 21/10 (XE-IDLEBOUND): desligamentos de 60 a 185 s (e o pânico do watchdog): o WindowServer fica em CGXShutdownDisplays ->
+// IOFBSetDisplayModeAndDepth -> IntelAccelerator::stopGraphicsEngine -> IGScheduler5::waitForGpuIdle (até 25000 x 100 us),
+// chamado várias vezes, com stamps que nunca retornam. Se uma espera esgota (>= 2 s), as esperas dos próximos 30 s
+// retornam na hora (a marca expira, para não afetar o uso normal). -ngreennoidlebound desliga.
+static volatile uint64_t gXeWedgedUntil = 0; static volatile uint32_t gXeIdleSkips = 0;
+void Gen11::wrapWaitForGpuIdle(void *that)
+{
+	static int off = -1;
+	if (off < 0) off = checkKernelArgument("-ngreennoidlebound") ? 1 : 0;
+	uint64_t now = mach_absolute_time();
+	if (!off && now < gXeWedgedUntil) { gXeIdleSkips++; return; }
+	FunctionCast(wrapWaitForGpuIdle, callback->oWaitForGpuIdle)(that);
+	uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - now, &ns);
+	if (ns >= 2000000000ULL) {
+		uint64_t d = 0; nanoseconds_to_absolutetime(30ULL * 1000000000ULL, &d);
+		gXeWedgedUntil = mach_absolute_time() + d;
+		SYSLOG("ngreen", "XE-IDLEBOUND: waitForGpuIdle levou %llu ms; esperas puladas por 30 s", ns / 1000000ULL);
+	}
+}
+
+// 20/10 (XE-FBDPMS): a tela não acordava do repouso. AppleIntelFramebuffer::setFramebufferPowerState(state) (2=Wake,
+// 1=Doze, 0=Sleep; estado atual em fb+0x4284) chama prepareToExitWake ao sair de Wake, que desliga pipe A,
+// TRANS_DDI_FUNC_CTL_A, DDI_BUF_CTL_A, escalador e painel; ao voltar, prepareToEnterWake religa painel e plano mas não
+// o pipe/link eDP (o FB TGL não treina o link do display 13; no boot ele herda a tela do firmware). Medido com
+// ~/xe/tools/xe-sleep-diag.sh. Aqui, no FB0 (painel interno): Wake -> Doze/Sleep só apaga a luz de fundo (BLC_CTL bit 31)
+// e grava o novo estado; Doze/Sleep -> Wake só reacende. O caminho de vídeo nunca é desmontado, e as trocas de modo
+// (que não passam por aqui) continuam normais. A XE-NODPMS (filtro de escritas) quebrava as trocas de modo.
+// -ngreenfbdpms volta ao original.
+static uint32_t gXeFbBlcCtl = 0, gXeFbBlcDuty = 0;
+static bool gXeFbFake = false;
+IOReturn Gen11::wrapSetFramebufferPowerState(void *that, unsigned int state)
+{
+	static int on = -1;
+	if (on < 0) on = (xeFixEnabled() && !checkKernelArgument("-ngreenfbdpms")) ? 1 : 0;
+	auto *fb = static_cast<uint8_t *>(that);
+	if (on && fb && NGreen::callback && *reinterpret_cast<uint32_t *>(fb + 0x1dc) == 0) {
+		uint32_t cur = *reinterpret_cast<uint32_t *>(fb + 0x4284);
+		if (state > 2) state = 2;
+		if (cur == 2 && state < 2) {
+			gXeFbBlcCtl = NGreen::callback->readReg32(0xC8250);
+			gXeFbBlcDuty = NGreen::callback->readReg32(0xC8258);
+			NGreen::callback->writeReg32(0xC8250, gXeFbBlcCtl & ~0x80000000u);   // luz de fundo off
+			*reinterpret_cast<uint32_t *>(fb + 0x4284) = state;
+			gXeFbFake = true; gXeFbDpmsN++;
+			IOLog("XeNG FBDPMS: FB0 %u -> %u: só luz de fundo off (BLC_CTL 0x%x duty 0x%x)\n", cur, state, gXeFbBlcCtl, gXeFbBlcDuty);
+			return kIOReturnSuccess;
+		}
+		if (cur < 2 && state < 2 && gXeFbFake) {           // Doze <-> Sleep enquanto "dormindo": só registra
+			*reinterpret_cast<uint32_t *>(fb + 0x4284) = state;
+			return kIOReturnSuccess;
+		}
+		if (cur < 2 && state == 2 && gXeFbFake) {
+			if (gXeFbBlcDuty) NGreen::callback->writeReg32(0xC8258, gXeFbBlcDuty);
+			NGreen::callback->writeReg32(0xC8250, gXeFbBlcCtl | 0x80000000u);   // luz de fundo on
+			*reinterpret_cast<uint32_t *>(fb + 0x4284) = 2;
+			gXeFbFake = false; gXeFbDpmsN++;
+			IOLog("XeNG FBDPMS: FB0 %u -> 2: luz de fundo on\n", cur);
+			return kIOReturnSuccess;
+		}
+	}
+	return FunctionCast(wrapSetFramebufferPowerState, callback->oSetFramebufferPowerState)(that, state);
+}
+
+void Gen11::IGAccelResourcefree(void *that)
+{
+	static int on = -1;
+	if (on < 0) on = checkKernelArgument("-ngreennoresfree") ? 0 : 1;
+	if (on == 1 && that) {
+		auto *o = static_cast<uint8_t *>(that);
+		uint8_t *tab = *reinterpret_cast<uint8_t **>(o + 0x250);
+		if (tab && !xeMapeado(reinterpret_cast<uint64_t>(tab))) {
+			*reinterpret_cast<uint8_t **>(o + 0x250) = nullptr;
+			gXeResFreeFix++;
+		} else if (tab) {
+			uint32_t na = o[0xac], nb = o[0xad], nc = o[0xae], sz = *reinterpret_cast<uint32_t *>(o + 0x258);
+			bool fora = false;
+			for (uint32_t i = 0; i < na && !fora; i++)
+				for (uint32_t j = nc; j < nc + nb; j++) {
+					uint64_t off = (uint64_t)(i * nb + j) * 40;
+					if (off + 40 > sz) { fora = true; break; }
+					uint64_t p = *reinterpret_cast<uint64_t *>(tab + off + 0x20);
+					if (p && !xeMapeado(p)) { *reinterpret_cast<uint64_t *>(tab + off + 0x20) = 0; gXeResFreeFix++; }
+				}
+			if (fora) { o[0xac] = 0; gXeResFreeFix++; }
+		}
+	}
+	FunctionCast(IGAccelResourcefree, callback->oIGAccelResourcefree)(that);
+}
+
 void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 {
 	// V69: Diagnostic hook — original crashes at +0x4c writing 0x44 bytes to buffer+0xD000.
@@ -5518,6 +7124,40 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 		return;
 	}
 
+	// xe/blitscratch (19/10): pular o passo 2 deixava o scratch dos kernels blit3d ZERADO (dump: instrBase 0x477a3000
+	// +0x4c0 = 0). Todo blit 3D do kernel (flip do pipe de display, cópias de IOSurface) executava zeros nas EUs ->
+	// RCS preso no PIPE_CONTROL depois do 3DPRIMITIVE -> gpuRestart em cascata. Refaz o passo 2 pelo wrapper
+	// (que exige lock/unlock do IOAF2 resolvidos, V181). -ngreennoblitscratch volta ao comportamento antigo.
+	static int blitScratch = -1;
+	if (blitScratch < 0) blitScratch = (checkKernelArgument("-ngreenxefix") && !checkKernelArgument("-ngreennoblitscratch")) ? 1 : 0;
+	if (blitScratch == 1 && callback->oIGMappedBuffergetMemory) {
+		// 19/10 (BLITSCRATCH2): o wrapper V181 abortava (resolução de lock/unlock comentada em kern_green). Agora
+		// chama o original com lockForCPUAccess redirecionado para a CPU VA do IGSharedMappedBuffer (ver wrapLockCpu).
+		void *mem = FunctionCast(IGMappedBuffergetMemory, callback->oIGMappedBuffergetMemory)(mappedBufPtr);
+		uint64_t bufSize = getMember<uint64_t>(mappedBufPtr, 0x20);
+		void *cpu = gSmbGetVA ? reinterpret_cast<void *(*)(void *)>(gSmbGetVA)(mappedBufPtr) : nullptr;
+		uint32_t antes = cpu ? *reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(cpu) + 0x4c0) : 0xdead;
+		bool ok = mem && cpu && gXeLockRouted && bufSize >= 0xd210 && callback->oblit3d_initialize_scratch_space;
+		// 19/10: a CPU VA do buffer só mapeia 0xd000 bytes (pânico: write fault em cpu+0xd000 no memcpy de 0x44 bytes,
+		// o mesmo crash do V69). O original escreve num buffer temporário e só [0, 0xd000) é copiado (todos os kernels
+		// ficam abaixo de 0xd000; perdem-se os estados de sampler/blend em 0xd000..0xd210).
+		void *tmp = ok ? IOMallocZero(0xe000) : nullptr;
+		if (ok && tmp) {
+			gXeBlitCpu = tmp;
+			gXeBlitMem = mem;
+			FunctionCast(blit3d_initialize_scratch_space, callback->oblit3d_initialize_scratch_space)(mem);
+			gXeBlitMem = nullptr;
+			gXeBlitCpu = nullptr;
+			memcpy(cpu, tmp, 0xd000);
+		}
+		if (tmp) IOFree(tmp, 0xe000);
+		uint32_t depois = cpu ? *reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(cpu) + 0x4c0) : 0xdead;
+		static int bsN = 0;
+		if (bsN++ < 8)
+			IOLog("XeNG BLITSCRATCH2: mem=%p cpu=%p size=0x%llx routed=%d ok=%d [0x4c0] %08x -> %08x (esperado 2420005b)\n",
+				  mem, cpu, (unsigned long long)bufSize, gXeLockRouted, ok, antes, depois);
+	}
+
 	uint64_t rc = FunctionCast(blit3d_init_ctx, callback->oblit3d_init_ctx)(that);
 	if (v69Verbose)
 		SYSLOG("ngreen", "V148: blit3d_init_ctx returned %llu, ctx+0xb8=0x%llx ctx+0xd8=%p ctx+0xe0=%p",
@@ -5540,9 +7180,22 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 // Fix: call the original (must keep its side-effects), then immediately clear bit 14
 // using a masked write (upper 16 = mask, lower 16 = 0). This fires before any context
 // is ever submitted, so the DMA buffer snapshot captures 0x0000 instead of 0x4000.
+// xe/inert (-ngreenengineinert, 2026-10-18): hipotese de teste — a GPU executando comandos escreve por DMA em enderecos errados
+// e corrompe memoria (heap do WindowServer e do kernel; panics pmap/zalloc). Com este modo o startGraphicsEngine NAO ativa
+// nenhum engine (RING_CTL/execlist ficam parados) e devolve sucesso; o display continua (nao depende dos engines).
+// Esperado: Metal fica esperando a GPU (stamps) sem corromper memoria. Estado dos aneis e logado a cada chamada.
 unsigned long Gen11::startGraphicsEngine(void *that)
 {
 	static int startCount = 0;
+
+	if (xeEngineInertOn()) {
+		static int inertN = 0;
+		if (inertN++ < 16)
+			SYSLOG("ngreen", "XE-INERT[%d]: startGraphicsEngine PULADO (RCS CTL=0x%08x HEAD=0x%x TAIL=0x%x | BCS CTL=0x%08x) -> sucesso",
+				   inertN, NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE)), NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)),
+				   NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)), NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)));
+		return 1;
+	}
 
 	if (!NGreen::callback->isRealTGL) {
 		startCount++;
@@ -5557,6 +7210,7 @@ unsigned long Gen11::startGraphicsEngine(void *that)
 			(GEN9_FFSC_PERCTX_PREEMPT_CTRL << 16) | 0);
 		SYSLOG("ngreen", "V163: startGraphicsEngine post-clear FF_SLICE_CS_CHICKEN1=0x%08x (ret=%lu)",
 			NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1), ret);
+		xeLrcaRepair("post-start");
 	}
 
 	return ret;
@@ -5567,8 +7221,22 @@ unsigned long Gen11::startGraphicsEngine(void *that)
 // interfere with ring initialization and leave CTL=0 (ring never enabled).
 // GT WAs are applied pre-stop via applyPreStopEngineWorkarounds; they persist in
 // hardware state and the context image (V504) across the stop→start cycle.
+
+// xe/xefix: Wa_1607297627 (i915 rcs_engine_wa_init, tgl/adl-p): RING_PSMI_CTL(RCS) bits 12|7
+// (RC_SEMA_IDLE_MSG_DISABLE | WAIT_FOR_EVENT_POWER_DOWN_DISABLE), registrador mascarado. No NootedGreen
+// original essa WA ficava em código morto (depois de um return). Sem ela o RCS dorme esperando evento e o
+// acelerador trava em "timeout waiting for IntelAccelerator stamp". O IntelIGPU-Tahoe aplica a mesma coisa.
+static void xeFixApplyRcsPsmi(const char *where, int n) {
+	if (!xeFixEnabled() || !NGreen::callback) return;
+	uint32_t before = NGreen::callback->readReg32(0x2050);
+	NGreen::callback->writeReg32(0x2050, (0x1080u << 16) | 0x1080u);
+	uint32_t after = NGreen::callback->readReg32(0x2050);
+	static int logs = 0;
+	if (logs++ < 16) IOLog("XeNG xefix: RCS PSMI %s[%d] 0x%x -> 0x%x\n", where, n, before, after);
+}
 void Gen11::applyPreStartEngineWorkarounds(int callCount)
 {
+	xeFixApplyRcsPsmi("pre-start", callCount);
 	uint32_t preErr = NGreen::callback->readReg32(ERROR_GEN6);
 	if (preErr) {
 		NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
@@ -5583,6 +7251,7 @@ void Gen11::applyPreStartEngineWorkarounds(int callCount)
 // ring and need to be in place before the context image is captured on stop.
 void Gen11::applyPreStopEngineWorkarounds(int callCount)
 {
+	xeFixApplyRcsPsmi("pre-stop", callCount);
 	// ── GT workarounds (gen12_gt_workarounds_init / rcs_engine_wa_init) ──
 	// Applied on every reset — same set as Linux i915 for TGL/ADL-P.
 	/* Wa_14011060649:tgl,rkl,dg1,adl-s,adl-p */
@@ -5818,6 +7487,8 @@ uint64_t Gen11::IGHardwareContextinitWithOptions(void *that, void *task, const v
 	cb->writeReg32(GGTT_PTE_HI(0), p1Hi);
 	cb->writeReg32(0x101008, 0x1);
 
+	IOLog("XeNG V509 init lrca=%x DW0..3=%08x %08x %08x %08x DW80=%08x %s\n", lrcaGpuVa, (uint32_t)ap[0], (uint32_t)ap[1],
+		  (uint32_t)ap[2], (uint32_t)ap[3], (uint32_t)ap[80], ap[1] == 0x00ffffff ? "REPARA" : "ok");
 	if (ap[1] != 0x00ffffff) {
 		// Already has a valid LRI header — restoreFromSafeImage gave us a good image.
 		SYSLOG("ngreen", "V509: DW1=%08x (valid), no repair needed", (uint32_t)ap[1]);
@@ -5954,6 +7625,8 @@ void *Gen11::IGHardwareContextwithOptions(void *task, const void *params, uint8_
 		       ap[0], ap[1], ap[2], ap[3], ap[4], ap[5], ap[6], ap[7]);
 	}
 
+	IOLog("XeNG V509 withOptions lrca=%x slot19 DW1=%08x ctx DW1=%08x %s\n", lrcaGpuVa, (uint32_t)ap[1], buf[1],
+		  ((ap[1] & 0x1F801000) != 0x11001000 && (buf[1] & 0x1F801000) == 0x11001000) ? "COPIA->slot19" : "-");
 	if ((ap[1] & 0x1F801000) != 0x11001000) {
 		if ((buf[1] & 0x1F801000) == 0x11001000) {
 			for (int i = 0; i < 96; i++) ap[i] = buf[i];
@@ -6184,7 +7857,16 @@ void  Gen11::initBlitUsage(void *that)
 	FunctionCast(initBlitUsage, callback->oinitBlitUsage)(that);
 }
 
+// xe/blitdiag (19/10): cada saída do submitBlit registra a linha de origem, a rota (routeSel) e o retorno (IOLog;
+// o SYSLOG não aparece no Tahoe).
+static unsigned long xeBlitRet(uint32_t k, uint32_t rs, void *task, int linha, unsigned long r) {
+	if (k <= 48 || !(k & 63)) IOLog("XeNG BLIT #%u routeSel=%u task=%p saida=L%d ret=0x%lx\n", k, rs, task, linha, r);
+	return r;
+}
 unsigned long Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param_3, bool param_4) {
+	static volatile uint32_t xeBlitN = 0;
+	const uint32_t xeK = ++xeBlitN;
+	const uint32_t xeRs = param_1 ? ((reinterpret_cast<uint8_t *>(param_1)[0xA2] >> 3U) & 0x3U) : 9;
 	// V186: For spoofed non-TGL, if V142 is configured to bypass submitBlit,
 	// return before any task/context touching logic. The V149/V171 path writes
 	// task+0x298 and can poison task lifetime on some boots, later crashing in
@@ -6213,10 +7895,10 @@ unsigned long Gen11::submitBlit(void *that, void *param_1, void *param_2, void *
 				}
 			}
 			if (v186Mode == 2)
-				return 1;
+				return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(1));
 			if (v186Mode == 1)
-				return 0;
-			return static_cast<uint32_t>(kIOReturnUnsupported);
+				return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(0));
+			return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(static_cast<uint32_t>(kIOReturnUnsupported)));
 		}
 	}
 
@@ -6342,10 +8024,10 @@ unsigned long Gen11::submitBlit(void *that, void *param_1, void *param_2, void *
 		}
 
 		if (v120Mode == 2)
-			return 1;
+			return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(1));
 		if (v120Mode == 1)
-			return static_cast<uint32_t>(kIOReturnUnsupported);
-		return 0;
+			return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(static_cast<uint32_t>(kIOReturnUnsupported)));
+		return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(0));
 	}
 
 	if (!NGreen::callback->isRealTGL) {
@@ -6368,11 +8050,11 @@ unsigned long Gen11::submitBlit(void *that, void *param_1, void *param_2, void *
 			}
 
 			if (v142Mode == 2)
-				return 1;
+				return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(1));
 			if (v142Mode == 1)
-				return 0;
+				return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(0));
 			// Mode 0 is intentionally harsh and should only be used for explicit diagnostics.
-			return static_cast<uint32_t>(kIOReturnUnsupported);
+			return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(static_cast<uint32_t>(kIOReturnUnsupported)));
 		}
 	}
 
@@ -6383,7 +8065,12 @@ unsigned long Gen11::submitBlit(void *that, void *param_1, void *param_2, void *
 	// on a MI_SEMAPHORE_WAIT for the value RCS never writes → Sig 803 GPU reset loop.
 	// routeSel=0..2 (2D blits, Apple logo, compositor) pass through safely.
 	// Side effect: cursor sprite (uses routeSel=3) becomes invisible — acceptable vs. GPU hang.
-	if (!NGreen::callback->isRealTGL && param_1) {
+	// xe (19/10): com -ngreenxefix o V193 fica desligado (religar com -ngreenv193). O "hang do shader TGL no RPL" era o
+	// estado do blit3d gravado 0x18 bytes fora do lugar (corrigido pelo XE-POOLALIGN); bloquear o blit sem executar
+	// deixa o stamp reservado pendurado (índice 9) e o WindowServer espera para sempre.
+	static int v193Arg = -1;
+	if (v193Arg < 0) v193Arg = (checkKernelArgument("-ngreenv193") || !checkKernelArgument("-ngreenxefix")) ? 1 : 0;
+	if (v193Arg == 1 && !NGreen::callback->isRealTGL && param_1) {
 		auto *blit193 = reinterpret_cast<uint8_t *>(param_1);
 		const uint32_t routeSel193 = (blit193[0xA2] >> 3U) & 0x3U;
 		if (routeSel193 == 3) {
@@ -6392,7 +8079,7 @@ unsigned long Gen11::submitBlit(void *that, void *param_1, void *param_2, void *
 				v193Count++;
 				SYSLOG("ngreen", "V193[%d]: blocked routeSel=3 on RPL (TGL EU shader → RCS hang)", v193Count);
 			}
-			return 1;
+			return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(1));
 		}
 	}
 
@@ -6404,11 +8091,11 @@ unsigned long Gen11::submitBlit(void *that, void *param_1, void *param_2, void *
 			SYSLOG("ngreen", "V134: osubmitBlit is null, preventing call-through crash");
 		}
 		if (!NGreen::callback->isRealTGL)
-			return 0;
-		return static_cast<unsigned long>(kIOReturnUnsupported);
+			return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(0));
+		return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(static_cast<unsigned long>(kIOReturnUnsupported)));
 	}
 
-	return FunctionCast(submitBlit, callback->osubmitBlit)(that, param_1, param_2, param_3, param_4);
+	return xeBlitRet(xeK, xeRs, param_3, __LINE__, (unsigned long)(FunctionCast(submitBlit, callback->osubmitBlit)(that, param_1, param_2, param_3, param_4)));
 }
 
 void  Gen11::markBlitUsage(void *that)
@@ -7010,6 +8697,8 @@ uint32_t Gen11::wrapReadRegister32(void *controller, uint32_t address) {
 }
 
 void Gen11::wrapWriteRegister32(void *controller, uint32_t address, uint32_t value) {
+	if (xeInertDrop(address)) return;
+	if ((address & 0xFFFFF) == 0xC8254 || (address & 0xFFFFF) == 0xC8258) value = xeFixFilterWrite(address, value);  // 20/10: só o brilho (XE-BLR) neste caminho
 	if (controller == nullptr) {
 		NGreen::callback->writeReg32(address, value);
 		return;
@@ -8172,8 +9861,11 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 	uint32_t emrRcs = NGreen::callback->readReg32(RING_EMR(RENDER_RING_BASE));
 	uint32_t emrBcs = NGreen::callback->readReg32(RING_EMR(BLT_RING_BASE));
 	uint32_t err    = NGreen::callback->readReg32(ERROR_GEN6);
-	if (v71Count <= 3 || (err != 0 && v71Count <= 50) ||
-	    ((emrRcs != 0xFFFFFFFF || emrBcs != 0xFFFFFFFF) && v71Count <= 50)) {
+	// 19/10: o pânico "spinlock timeout, owner=current_thread" parou dentro deste SYSLOG; com xefix ele não é mais emitido
+	static int v74Quiet = -1;
+	if (v74Quiet < 0) v74Quiet = checkKernelArgument("-ngreenxefix") ? 1 : 0;
+	if (!v74Quiet && (v71Count <= 3 || (err != 0 && v71Count <= 50) ||
+	    ((emrRcs != 0xFFFFFFFF || emrBcs != 0xFFFFFFFF) && v71Count <= 50))) {
 		SYSLOG("ngreen", "V74Ep[%d]: EMR_RCS=0x%x EMR_BCS=0x%x ERR=0x%x (V74 EMR mask removed)",
 		       v71Count, emrRcs, emrBcs, err);
 	}
@@ -8507,6 +10199,155 @@ static const FwMediaEngine fwMediaEngines[] = {
 	{ FORCEWAKE_MEDIA_VEBOX_GEN11(0), FORCEWAKE_ACK_MEDIA_VEBOX_GEN11(0), "VEBOX0" },  // 0xa560 / 0x0D70
 };
 
+// ─── xe/rc6fw (22/10): forcewake ctx 1 balanced + released on idle ─────────────────────────────────────────
+// Apple's IntelAccelerator::SafeForceWake(bool, uint dom) (TGL 16.0.x, file offset 0x28c2a) keeps SIGNED counters per
+// domain at accel+0x1290/0x1294/0x1298 (render/media/GT) under the spin lock *(accel+0x1468), and calls
+// SafeForceWakeMultithreaded(set, changed, ctx=1) (= our forceWake) only on transitions:
+//   get: count++ , wake if the old count <= 0;    put: count-- , release only if the old count == 1.
+// That is asymmetric: one extra put leaves the count at -1; from then on every get (-1 -> 0) wakes and every put
+// (0 -> -1) does NOT release -> forcewake bit 1 stays set on RENDER/GT/VDBOX0/VEBOX0 forever and the GT never enters
+// RC6 (seen 22/10 04:25: RC6 0 %, GT 4.6-5.3 W, all engines idle, MI_MODE idle bit set). A get without a put (leak)
+// has the same visible effect. This block:
+//   (1) replaces SafeForceWake's multi-forcewake path with the same algorithm but with the count clamped at 0
+//       (an extra put is ignored and logged, so it can never turn into a sticky hold);
+//   (2) runs a 100 ms watchdog: if any count is > 0 while there has been no SafeForceWake call and no execlist
+//       submission for ngreenfwidle ms (default 500) and every engine reports idle (RING_MI_MODE bit 9), the hold is
+//       a leak: the counts are zeroed under Apple's lock and ctx 1 is released (logged with the caller of the
+//       leaked get). A later stray put is absorbed by (1). Apple itself never needs ctx 1 while the engine runs:
+//       submitExecList drops it right after writing the ELSP, and the interrupt path uses ctx 2.
+//   (3) publishes diagnostics on the IntelAccelerator service (ioreg -rc IntelAccelerator | grep xe-fw).
+// Off: -ngreennorc6fw (pure Apple path, as before). Keep (1)+(3) but never drop: -ngreenrc6fwnodrop.
+static inline uint64_t xeFwOff(uint64_t ra) {
+	// return address -> AppleIntelTGLGraphics file offset (matches `otool -tV` addresses)
+	return (gFwSymAddr && ra > gFwSymAddr - 0x28c2a) ? ra - gFwSymAddr + 0x28c2a : 0;
+}
+
+static inline IOSimpleLock *xeAppleFwLock(uint8_t *a) {
+	void *holder = *reinterpret_cast<void **>(a + 0x1468);
+	return holder ? *reinterpret_cast<IOSimpleLock **>(holder) : nullptr;
+}
+
+static void xeSafeForceWake(void *that, bool set, uint32_t dom) {
+	auto *a = static_cast<uint8_t *>(that);
+	if (gRc6FwOn != 1 || !dom || !a) {
+		FunctionCast(xeSafeForceWake, gOrgSafeForceWake)(that, set, dom);
+		return;
+	}
+	uint64_t flags = *reinterpret_cast<volatile uint64_t *>(a + 0x1190);
+	IOSimpleLock *lk = xeAppleFwLock(a);
+	if ((flags & 0x1000) || !(flags & 0x800) || !lk) {  // not the MultiForceWake path: Apple's code unchanged
+		FunctionCast(xeSafeForceWake, gOrgSafeForceWake)(that, set, dom);
+		return;
+	}
+	gFwAccel = that;
+	uint64_t caller = xeFwOff(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	auto *cnt = reinterpret_cast<volatile int32_t *>(a + 0x1290);
+	IOSimpleLockLock(lk);
+	uint32_t changed = 0;
+	for (unsigned i = 0; i < 3; i++) {
+		uint32_t d = 1u << i;
+		if (!(dom & d)) continue;
+		int32_t c = cnt[i];
+		if (c < 0) { gFwUnderflow++; c = 0; }  // left by Apple's original code (before the route) or a reset
+		if (set) {
+			cnt[i] = c + 1;
+			if (c == 0) { changed |= d; gFwLastGetCaller[i] = caller; }
+		} else if (c == 0) {
+			gFwUnderflow++; gFwUnderflowCaller = caller;   // extra put: ignore (Apple would go to -1 = sticky hold)
+			cnt[i] = 0;
+			xeEv('FWUF', i, (uint32_t)caller, gFwUnderflow);
+		} else {
+			cnt[i] = c - 1;
+			if (c == 1) changed |= d;
+		}
+	}
+	gFwActSeq++;
+	if (changed) Gen11::xeForceWakePub(that, set, changed, 1);
+	IOSimpleLockUnlock(lk);
+}
+
+static inline bool xeEngIdle(uint32_t base) {
+	// RING_MI_MODE bit 9 = MODE_IDLE. 0 = engine fused off / powered down (also idle).
+	// never let readReg32 fall into its index/data (write) path: only read inside the mapped BAR
+	auto *cb = NGreen::callback;
+	if (base + 0xa0 > cb->mmioLength()) return false;  // outside the BAR / unmapped -> treat as busy (never drop)
+	uint32_t m = cb->readReg32(base + 0x9c);
+	return m == 0 || m == 0xffffffff || (m & 0x200);
+}
+
+static void xeFwIdleWorker(thread_call_param_t, thread_call_param_t) {
+	static uint32_t lastSeq = 0, lastSub = 0, quietMs = 0, pubTick = 0;
+	const uint32_t tick = 100;
+	void *acc = gFwAccel;
+	if (acc && NGreen::callback) {
+		auto *a = static_cast<uint8_t *>(acc);
+		auto *cnt = reinterpret_cast<volatile int32_t *>(a + 0x1290);
+		uint32_t seq = gFwActSeq, sub = gCs5SubmitN;
+		if (seq != lastSeq || sub != lastSub) { quietMs = 0; lastSeq = seq; lastSub = sub; }
+		else if (quietMs < 0x40000000) quietMs += tick;
+		// held = Apple still counts a holder, or our FWREF count for ctx 1 is set while Apple's is not (desync, e.g. after
+		// IntelAccelerator::systemDidWake zeroes Apple's counts but not ours -> the next get/put pair would leave it held)
+		bool held = false;
+		for (unsigned i = 0; i < 3; i++) if (cnt[i] > 0 || gFwRef[i][1] > 0) held = true;
+		if (gRc6FwDrop && held && quietMs >= gRc6IdleMs) {
+			// 0x1c4000 (VCS1) is fused off on this SKU; VCS2 0x1d0000 reads 0 when unused
+			bool idle = xeEngIdle(0x2000) && xeEngIdle(0x22000) && xeEngIdle(0x1c0000) &&
+			            xeEngIdle(0x1c8000) && xeEngIdle(0x1d0000);
+			IOSimpleLock *lk = idle ? xeAppleFwLock(a) : nullptr;
+			if (lk) {
+				IOSimpleLockLock(lk);
+				if (gFwActSeq == seq && gCs5SubmitN == sub) {  // nobody took/released forcewake meanwhile
+					uint32_t drop = 0;
+					int32_t c0 = cnt[0], c1 = cnt[1], c2 = cnt[2];
+					for (unsigned i = 0; i < 3; i++) {
+						if (cnt[i] > 0 || gFwRef[i][1] > 0) {
+							drop |= 1u << i;
+							if (cnt[i] > 0) gFwLeakCaller = gFwLastGetCaller[i];
+							cnt[i] = 0;
+							// make forceWake's FWREF do exactly one 1->0 transition (it ignores a put at 0)
+							if (gFwLock) gFwRef[i][1] = 1;
+						}
+					}
+					if (drop) {
+						Gen11::xeForceWakePub(acc, false, drop, 1);
+						gFwLeakDrops++; gFwLeakDom |= drop;
+						xeEv('FWLK', drop, (uint32_t)gFwLeakCaller, (uint32_t)((c0 & 0xff) | ((c1 & 0xff) << 8) | ((c2 & 0xff) << 16)));
+					}
+				}
+				IOSimpleLockUnlock(lk);
+			}
+			quietMs = 0;
+		}
+		if (++pubTick >= 10) {  // 1 s: publish diagnostics (thread context, outside any lock)
+			pubTick = 0;
+			auto *svc = static_cast<IOService *>(acc);
+			svc->setProperty("xe-fw-leakdrops", gFwLeakDrops, 32);
+			svc->setProperty("xe-fw-leakdom", gFwLeakDom, 32);
+			svc->setProperty("xe-fw-leakcaller", (unsigned long long)gFwLeakCaller, 64);
+			svc->setProperty("xe-fw-underflow", gFwUnderflow, 32);
+			svc->setProperty("xe-fw-underflowcaller", (unsigned long long)gFwUnderflowCaller, 64);
+			svc->setProperty("xe-fw-count", (unsigned long long)(((uint64_t)(uint32_t)cnt[0]) | ((uint64_t)(uint16_t)cnt[1] << 32) | ((uint64_t)(uint16_t)cnt[2] << 48)), 64);
+		}
+	}
+	if (gFwIdleTc) {
+		uint64_t deadline = 0;
+		clock_interval_to_deadline(tick, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gFwIdleTc, deadline);
+	}
+}
+
+static void xeRc6FwStart(void *accel) {
+	if (gRc6FwOn != 1 || gFwIdleTc) return;
+	gFwAccel = accel;
+	gFwIdleTc = thread_call_allocate(xeFwIdleWorker, nullptr);
+	if (gFwIdleTc) {
+		uint64_t deadline = 0;
+		clock_interval_to_deadline(5000, kMillisecondScale, &deadline);  // start after the accelerator is up
+		thread_call_enter_delayed(gFwIdleTc, deadline);
+	}
+	SYSLOG("ngreen", "XE-RC6FW: watchdog %s (idle %u ms, drop %d)", gFwIdleTc ? "armed" : "FAILED", gRc6IdleMs, gRc6FwDrop);
+}
+
 void Gen11::wrapSafeForceWake(void *that, bool set, uint32_t dom) {
 	forceWake(that, set, dom, 1);  // forward to our forceWake with ctx=1 (normal, non-IRQ)
 }
@@ -8523,9 +10364,20 @@ void Gen11::forceWake(void *that, bool set, uint32_t dom, uint8_t ctx) {
 	static bool hangcheckDumped = false;
 	fwCallCount++;
 	
-	if (!hangcheckDumped && fwCallCount == 15) {
+	static int hcQuiet = -1;  // 19/10: dezenas de SYSLOG aqui; o forcewake pode estar em interrupção
+	if (hcQuiet < 0) hcQuiet = checkKernelArgument("-ngreenxefix") ? 1 : 0;
+	if (!hcQuiet && !hangcheckDumped && fwCallCount == 15) {
 		hangcheckDumped = true;
 		SYSLOG("ngreen", "=== HANGCHECK: GPU state dump (fwCall=%d) ===", fwCallCount);
+		SYSLOG("ngreen", "FBMODE hook: calls=%u bootprog=%u subst=%u argseen=%u lastret=0x%x lastmode=0x%x", gFbModeCalls,
+			   gFbModeBootProg, gFbModeSubst, gFbModeArgSeen, gFbModeLastRet, gFbModeLastMode);
+		SYSLOG("ngreen", "FBMODE state: tglblock=%u routes=%u icl=%u org_gcdm=0x%llx org_gpi=0x%llx org_vdm=0x%llx",
+			   gTglFbBlockRuns, gTglFbRoutesDone, gIcLFbBlockRuns, (unsigned long long)gOrgGcdm,
+			   (unsigned long long)gOrgGpi, (unsigned long long)gOrgVdm);
+		SYSLOG("ngreen", "FBMODE patch: tried=%u ok=%u", gFbModePatchTried, gFbModePatchOk);
+		SYSLOG("ngreen", "FBMODE timings: sym=0x%llx tc=%d tries=%u seen=%u online=%u already=%u built=%u done=%u ret=0x%x crtc=%ux%u",
+			   (unsigned long long)gHwCrtcToTimingAddr, gFbtTc != nullptr, gFbtTries, gFbtSeen, gFbtOnline, gFbtAlready,
+			   gFbtBuilt, gFbtDone, gFbtRet, gFbtH, gFbtV);
 		
 		// Acquire both Render + Blitter ForceWake for reliable reads
 		NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 1);
@@ -8864,30 +10716,78 @@ void Gen11::forceWake(void *that, bool set, uint32_t dom, uint8_t ctx) {
 	uint32_t mask = 1 << ctx;
 	uint32_t wr = ack_exp | (1 << ctx << 16);
 
+	// xe/fwref (19/10): contagem de referências por (domínio, ctx), como o SafeForceWakeMultithreaded da Apple.
+	// Sem ela, o "soltar" de um usuário desligava o forcewake de outro no meio do trabalho: a escrita da execlist do
+	// RCS, logo depois de o motor ficar ocioso (RC6), se perdia e o escalonador 5 esperava para sempre.
+	// Só escreve o registrador nas transições 0->1 e 1->0. Desliga com -ngreennofwref.
+	bool fwJaEscrito = false;
+	static int fwRelease = -1;
+	if (fwRelease < 0) fwRelease = checkKernelArgument("-ngreenfwhold") ? 0 : 1;  // 19/10: segurar sempre quebrou o boot
+	static int fwRefArg = -1;
+	if (fwRefArg < 0) fwRefArg = (checkKernelArgument("-ngreenxefix") && !checkKernelArgument("-ngreennofwref")) ? 1 : 0;
+	// xe/rc6fw (22/10): fwLock/fwRef moved to file scope (gFwLock/gFwRef) so the idle watchdog shares them
+	auto &fwLock = gFwLock;
+	auto &fwRef = gFwRef;
+	if (fwRefArg == 1 && !fwLock) {
+		IOSimpleLock *l = IOSimpleLockAlloc();
+		if (l && !__sync_bool_compare_and_swap(&fwLock, (IOSimpleLock *)nullptr, l)) IOSimpleLockFree(l);
+	}
+	if (fwRefArg == 1 && fwLock && ctx < 4) {
+		uint32_t mudar = 0;
+		// 19/10: o forcewake também é chamado em interrupção primária (panic "hwlock ... recursively" com o lock
+		// comum): desliga as interrupções enquanto segura o lock.
+		IOInterruptState fwIs = IOSimpleLockLockDisableInterrupt(fwLock);
+		for (unsigned d = DOM_FIRST, i = 0; d <= DOM_LAST && i < 8; d <<= 1, i++) {
+			if (!(dom & d)) continue;
+			if (set) {
+				if (fwRef[i][ctx]++ == 0) mudar |= d;
+			} else if (fwRef[i][ctx] > 0) {
+				// xe/fwhold (19/10): ao zerar, NÃO solta (o motor ficava em RC6 e a execlist escrita logo depois do
+				// fim do CSB se perdia). Mantém o forcewake ligado; -ngreenfwrelease volta a soltar.
+				if (--fwRef[i][ctx] == 0 && fwRelease) mudar |= d;
+			}
+		}
+		// a requisição é escrita ainda dentro do lock (a ordem das escritas segue a dos contadores); só o ACK é esperado fora
+		for (unsigned d = DOM_FIRST; d <= DOM_LAST; d <<= 1) {
+			if (!(mudar & d)) continue;
+			// 19/10: escrita direta no MMIO dentro da trava. wrapWriteRegister32 pode chamar o forcewake de novo
+			// (recursão -> panic "spinlock acquisition timeout, owner: current_thread").
+			if (d == DOM_MEDIA) {
+				for (const auto &eng : fwMediaEngines) NGreen::callback->writeReg32(eng.req, wr);
+			} else {
+				NGreen::callback->writeReg32(fwReqReg(d), wr);
+			}
+		}
+		IOSimpleLockUnlockEnableInterrupt(fwLock, fwIs);
+		dom = mudar;
+		if (!dom) return;
+		fwJaEscrito = true;
+	}
+
 	for (unsigned d = DOM_FIRST; d <= DOM_LAST; d <<= 1) {
 		if (!(dom & d)) continue;
 
 		if (d == DOM_MEDIA) {
 			// Gen12+: Media uses per-engine ForceWake (VDBOX + VEBOX), NOT Gen9 single register
 			for (const auto &eng : fwMediaEngines) {
-				wrapWriteRegister32(callback->framecont, eng.req, wr);
+				if (!fwJaEscrito) wrapWriteRegister32(callback->framecont, eng.req, wr);
 				IOPause(100);
 				if (!pollRegister(eng.ack, ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS) &&
 					!forceWakeWaitAckFallback(eng.req, eng.ack, ack_exp, mask) &&
 					!pollRegister(eng.ack, ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS))
-					SYSLOG("ngreen", "ForceWake timeout for %s (dom=0x%x), expected 0x%x", eng.name, dom, ack_exp);
+					xeEv('FWTO', eng.req, dom, ack_exp);  // 19/10: sem SYSLOG (pode estar em interrupção -> deadlock no lock do log)
 				else
-					DBGLOG("ngreen", "ForceWake OK %s set=%d", eng.name, set);
+					{ /* xe (19/10): "ForceWake OK" desligado, enchia o dmesg */ }
 			}
 		} else {
-			wrapWriteRegister32(callback->framecont, fwReqReg(d), wr);
+			if (!fwJaEscrito) wrapWriteRegister32(callback->framecont, fwReqReg(d), wr);
 			IOPause(100);
 			if (!pollRegister(fwAckReg(d), ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS) &&
 				!forceWakeWaitAckFallback(fwReqReg(d), fwAckReg(d), ack_exp, mask) &&
 				!pollRegister(fwAckReg(d), ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS))
-				SYSLOG("ngreen", "ForceWake timeout for domain %s (dom=0x%x), expected 0x%x", strForDom(d), dom, ack_exp);
+				xeEv('FWTO', fwReqReg(d), dom, ack_exp);  // 19/10: sem SYSLOG (idem)
 			else
-				DBGLOG("ngreen", "ForceWake OK domain=%s set=%d ack=0x%x", strForDom(d), set, wrapReadRegister32(callback->framecont, fwAckReg(d)));
+				/* xe (19/10): spam que enchia o dmesg */ if (0) DBGLOG("ngreen", "ForceWake OK domain=%s set=%d ack=0x%x", strForDom(d), set, wrapReadRegister32(callback->framecont, fwAckReg(d)));
 		}
 	}
 	// V61: silenced — see above
@@ -9385,16 +11285,18 @@ void Gen11::injectAcceleratorPersonality(bool useTglNames)
 	}
 
 	// V77: Display pipe capabilities forced to 0 to prevent WS GPU compositing crash.
+	// xe/dpcaps (19/10): com o display pipe nativo (sem -ngreendp0) isso deixava TransactionsSupported=0 enquanto
+	// o WindowServer usa o pipe: todo IOAccelDisplayPipeTransaction2::set_transaction_args voltava 0xe00002c7
+	// (unsupported), nenhum quadro era apresentado e os stamps das filas de flip nunca fechavam (GPU restart).
+	// Agora: modo nativo anuncia o mesmo que o Info.plist do TGL da Apple (as duas true); -ngreendp0 mantém 0.
 	auto *dpCaps = OSDictionary::withCapacity(2);
 	if (dpCaps) {
-		auto *dpSupp = OSNumber::withNumber(static_cast<unsigned long long>(0), 32);
-		auto *trSupp = OSNumber::withNumber(static_cast<unsigned long long>(0), 32);
-		dpCaps->setObject("DisplayPipeSupported", dpSupp);
-		dpCaps->setObject("TransactionsSupported", trSupp);
-		OSSafeReleaseNULL(dpSupp);
-		OSSafeReleaseNULL(trSupp);
+		const bool dpOff = isDisplayPipeForceDisabled();
+		dpCaps->setObject("DisplayPipeSupported", dpOff ? kOSBooleanFalse : kOSBooleanTrue);
+		dpCaps->setObject("TransactionsSupported", dpOff ? kOSBooleanFalse : kOSBooleanTrue);
 		dict->setObject("IOAccelDisplayPipeCapabilities", dpCaps);
 		dpCaps->release();
+		SYSLOG("ngreen", "XE-DPCAPS: DisplayPipeSupported=%d TransactionsSupported=%d", !dpOff, !dpOff);
 	}
 
 	SYSLOG("ngreen", "injectAcceleratorPersonality: personality has %u properties", dict->getCount());
@@ -9484,9 +11386,44 @@ void Gen11::SetupTimings(void *that, void *param_1, void *param_2, void *param_3
 }
 
 uint8_t Gen11::validateDisplayMode(void *that, int param_1,void *param_2, void *param_3){
-	auto displayTimingInfo = const_cast<IODetailedTimingInformationV2 *>(reinterpret_cast<const IODetailedTimingInformationV2 *>(param_3));
-	if (displayTimingInfo!=nullptr) displayTimingInfo->pixelClock = 785400000;
-	auto ret= FunctionCast(validateDisplayMode, callback->ovalidateDisplayMode)(that,param_1,param_2,param_3);
+	// xe/max2560 (-ngreenmax2560): rejeita modos acima de 2560 px de largura, para o driver
+	// escolher o 2560x1600 que o autor do NootedGreen validou. Não altera o pixel clock.
+	// Chama o original SEMPRE (ele inicializa o modo); só depois rejeita. Pular a chamada causou page fault
+	// em getTimingInfoForDisplayMode (panic 2026-10-17 10:54).
+	uint8_t ret = FunctionCast(validateDisplayMode, callback->ovalidateDisplayMode)(that,param_1,param_2,param_3);
+	auto timing = reinterpret_cast<const IODetailedTimingInformationV2 *>(param_3);
+	if (ret && timing && checkKernelArgument("-ngreenmax2560") && timing->horizontalActive > 2560)
+		return 0;
+	return ret;
+}
+
+uint32_t Gen11::getCurrentDisplayMode(void *that, int *displayMode, int *depth) {
+	// xe/bootmode (-ngreenfixbootmode): com o DisplayPipe nativo, IOAccelDisplayPipe::init_framebuffer_resource
+	// pergunta o modo atual do FB0 antes de o WindowServer definir qualquer modo. O FB responde
+	// kIOFBBootProgrammable (0xfffffffb, fDetailedTimings=0), getPixelInformation falha (0xe00002c2), o CoreDisplay
+	// marca a tela principal como offline e o WindowServer aborta em loop. Com -ngreenkeepefi o painel já roda no
+	// modo nativo 3840x2400 (0x80001000), então devolvemos esse modo no lugar do boot-programmable.
+	uint32_t ret = FunctionCast(getCurrentDisplayMode, callback->ogetCurrentDisplayMode)(that, displayMode, depth);
+	gFbModeCalls++;
+	gFbModeLastRet = ret;
+	if (displayMode) gFbModeLastMode = (uint32_t)*displayMode;
+	if (displayMode && *displayMode == (int)0xfffffffb) {
+		gFbModeBootProg++;
+		if (gFbModeBootProg <= 6)
+			SYSLOG("ngreen", "FBMODE bootprog #%u: calls=%u ret=0x%x depth=%d arg=%d", gFbModeBootProg, gFbModeCalls, ret,
+				   depth ? *depth : -1, (int)checkKernelArgument("-ngreenfixbootmode"));
+	}
+	if (checkKernelArgument("-ngreenfixbootmode")) gFbModeArgSeen = 1;
+	if (ret == 0 && displayMode && *displayMode == (int)0xfffffffb && checkKernelArgument("-ngreenfixbootmode")) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			SYSLOG("ngreen", "fixbootmode: getCurrentDisplayMode boot-programmable -> 0x80001000 depth 1");
+		}
+		*displayMode = 0x80001000;
+		if (depth) *depth = 1;
+		gFbModeSubst++;
+	}
 	return ret;
 }
 
@@ -9500,6 +11437,23 @@ void Gen11::setupDisplayTiming (void *that,void *param_1,
 }
 
 unsigned long Gen11::getPixelInformation (void *that, uint param_1,int param_2,int param_3, void *param_4){
+	// xe/bootmode (-ngreenfixbootmode): IOAccelDisplayPipe::init_framebuffer_resource pede o pixel info do modo
+	// atual do FB0 enquanto ele ainda é kIOFBBootProgrammable (0xfffffffb, sem detailed timings) e isso falha
+	// (validateDisplayMode 0xe00002c2). Com -ngreenkeepefi o painel já roda no modo nativo (0x80001000).
+	static uint32_t gpiBoot = 0;
+	if (param_1 == 0xfffffffbu) {
+		gpiBoot++;
+		const bool fix = checkKernelArgument("-ngreenfixbootmode");
+		unsigned long r0 = 0;
+		if (fix) {
+			r0 = FunctionCast(getPixelInformation, callback->ogetPixelInformation)(that, 0x80001000u, param_2 ? param_2 : 1, param_3, param_4);
+			if (gpiBoot <= 6)
+				SYSLOG("ngreen", "FBMODE gpi bootprog #%u: depth=%d aperture=%d fix=%d -> 0x%lx", gpiBoot, param_2, param_3, (int)fix, r0);
+			return r0;
+		}
+		if (gpiBoot <= 6)
+			SYSLOG("ngreen", "FBMODE gpi bootprog #%u: depth=%d aperture=%d fix=0", gpiBoot, param_2, param_3);
+	}
 	return FunctionCast(getPixelInformation, callback->ogetPixelInformation)(that,param_1,param_2, param_3, param_4);
 }
 
@@ -9529,7 +11483,10 @@ uint8_t Gen11::enableController(AppleIntel::AppleIntelFramebuffer *that)
 uint8_t Gen11::setDisplayMode(AppleIntel::AppleIntelFramebuffer *that, int param_1, int param_2)
 {
 	if (getMember<uint32_t>(that, 0x1dc)==0) getMember<uint8_t>(that, 0x1e0)=1;
-	return FunctionCast(setDisplayMode, callback->osetDisplayMode)(that,param_1,param_2 );
+	xeBootDiagDump("pre-setDisplayMode");
+	auto r = FunctionCast(setDisplayMode, callback->osetDisplayMode)(that,param_1,param_2 );
+	xeBootDiagDump("post-setDisplayMode");
+	return r;
 
 }
 
@@ -9809,8 +11766,15 @@ int Gen11::hwSetMode
 	// (2-lane DP SST). Write the correct value NOW so paramsFbCompare sees no lane-count change
 	// needed and leaves DDI_BUF_CTL_A alone — preserving the UEFI-trained 4-lane eDP link.
 	if (!NGreen::callback->isRealTGL) {
-		NGreen::callback->writeReg32(0x60400, 0x8A000106);  // TRANS_DDI_FUNC_CTL_A
-		DBGLOG("ngreen", "hwSetMode: pre-write TRANS_DDI_FUNC_CTL_A=0x8A000106 to prevent paramsFbCompare lane reprog");
+		// XE-FWSNAP (audit c1): o valor treinado pelo firmware, não o literal de 4 faixas do upstream.
+		static int ddiArg = -1;
+		static uint32_t ddiOv = 0;
+		if (ddiArg < 0) { ddiArg = 0; if (PE_parse_boot_argn("ngreenddifunc", &ddiOv, sizeof(ddiOv)) && ddiOv) ddiArg = 1; }
+		xeFwSnapshot();
+		uint32_t v = ddiArg == 1 ? ddiOv : (gXeFwDdiFuncA ? gXeFwDdiFuncA : 0x8A000106u);
+		NGreen::callback->writeReg32(0x60400, v);
+		DBGLOG("ngreen", "hwSetMode: pre-write TRANS_DDI_FUNC_CTL_A=0x%x (%s) to prevent paramsFbCompare lane reprog",
+			   v, ddiArg == 1 ? "boot-arg" : (gXeFwDdiFuncA ? "firmware" : "fallback"));
 	}
 	auto ret= FunctionCast(hwSetMode, callback->ohwSetMode)(that, param_1, param_2, param_3);
 	if (hw)
@@ -9936,3 +11900,339 @@ void Gen11::endReset(void *that)
 //undefined8 __thiscall IntelAccelerator::stopGraphicsEngine(IntelAccelerator *this)
 //void __thiscall IGAccelSegmentResourceList::initBlitUsage(IGAccelSegmentResourceList *this)
 //ulong IntelAccelerator::submitBlit (blit3d_params_t *param_1,IGVector *param_2,IGAccelTask *param_3,bool param_4)
+
+// ─── xe/gpurec (22/10): recover the render reset domain sibling (RCS <-> CCS) after a GPU restart ───────────────
+// AppleIntelTGLGraphics 16.0.x, IGHardwareRingBuffer::resetGraphicsEngine (file 0x43576), host scheduler path:
+//   save ring->0x78 list (MMIO) -> GAMTARBMODE 0x4a08 |= bit2 -> GDRST 0x941c = ring->0x70 -> poll -> 0x4a08 &= ~bit2
+//   -> restore ring->0x78 list (value = accel->getDefaultResetValue(reg) ?: saved, masked regs | 0xffff0000)
+//   -> IGScheduler5::processGPUReset(ring->0x40 = IGHwCsType, ctx) for THAT engine only.
+// RCS (type 0, IGHardwareRingBufferMain::init 0x84d10) and CCS (type 1, IGHardwareRingBufferCompute::init 0x4e35a)
+// both use GDRST mask 0x2 (GEN11_GRDOM_RENDER, the shared render reset domain), but each restores only its own list
+// (_rcsResetRegisters / _ccsResetRegisters) and replays only its own engine. A reset of one therefore leaves the other
+// with HWS_PGA=0, GFX_MODE=0, FORCE_TO_NONPRIV at defaults, its in-flight context dropped by the hardware and the
+// scheduler still waiting for its CSB events: every gpuRestart report after the first CCS reset shows exactly that
+// (RCS GFX_MODE 0x8000->0, HWS_PGA 0x40004000->0, NONPRIV 0xe100->0xe000, EXECLIST_STATUS 0x1), its stamps never return,
+// restarts of its channels are "Skipped / no channel associated", WindowServer blocks and watchdogd panics.
+// Fix (what i915 does for engines that share a reset domain): around the original, snapshot the sibling's list; after
+// a real GDRST, restore it (same value rule as Apple, last known-good snapshot if the live one is already broken) and
+// run IGScheduler5::processGPUReset for the sibling (CSB head reset, in-flight stamps retired, execlist resubmitted).
+// Off: -ngreennogpurec. Diagnostics: ioreg -rc IntelAccelerator | grep xe-rec.
+static mach_vm_address_t gOrgRge = 0, gRecSfw = 0, gRecGetDef = 0, gRecS5Proc = 0, gRecList[2] = {0, 0};
+static int gRecOn = 0;
+static uint32_t gRecGood[2][64];
+static bool gRecGoodOk[2] = {false, false};
+static volatile uint32_t gRecResets = 0, gRecSibRestores = 0, gRecSibReplays = 0, gRecOwnFix = 0, gRecSkipKick = 0, gRecLast = 0;
+
+static inline uint32_t xeRecRd(volatile uint8_t *mmio, uint32_t r) { return *reinterpret_cast<volatile uint32_t *>(mmio + r); }
+static inline void xeRecWr(volatile uint8_t *mmio, uint32_t r, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(mmio + r) = v; }
+// IGVector<resetRegisterInfo>: {u64 count; u64 capacity; resetRegisterInfo *data}, entry 0x24 B: u32 reg, u32 val, u8 masked, name@0xa
+static inline bool xeRecList(int i, uint64_t &n, uint8_t *&d) {
+	auto *v = reinterpret_cast<uint8_t *>(gRecList[i]);
+	if (!v) return false;
+	n = *reinterpret_cast<uint64_t *>(v);
+	d = *reinterpret_cast<uint8_t **>(v + 0x10);
+	return d && n > 0 && n <= 64 && *reinterpret_cast<uint32_t *>(d) == (i == 0 ? 0x2080u : 0x1a080u);  // entry 0 = HWS_PGA
+}
+static inline uint32_t xeRecReg(uint8_t *d, uint64_t i) { return *reinterpret_cast<uint32_t *>(d + i * 0x24); }
+static inline bool xeRecMasked(uint8_t *d, uint64_t i) { return d[i * 0x24 + 8] != 0; }
+
+static void xeRecWriteList(void *acc, volatile uint8_t *mmio, uint8_t *d, uint64_t n, const uint32_t *src) {
+	auto getDef = reinterpret_cast<uint32_t (*)(void *, uint32_t)>(gRecGetDef);
+	for (uint64_t i = 0; i < n; i++) {
+		uint32_t reg = xeRecReg(d, i), v = getDef(acc, reg);
+		if (!v) v = src[i];
+		if (xeRecMasked(d, i)) v |= 0xffff0000u;
+		xeRecWr(mmio, reg, v);
+	}
+	(void)xeRecRd(mmio, xeRecReg(d, 0));  // posting read
+}
+
+// ─── xe/gpurec2 (23/10): registers of the render reset domain that are in NEITHER Apple reset list ──────────────
+// IntelAccelerator::initModeRegisters (file 0x28e1a, called only from startGraphicsEngine 0x2513e, i.e. boot/wake) writes
+//   RCU_MODE 0x14800 = masked bit0 <- (accel->0x1190 >> 33) & 1   ("Multi-Context (Compute Command Streamer) Enabled")
+//   0xce90 |= 0x10001 (conditional), CCS FORCE_TO_NONPRIV0 0x1a4d0 = 0xb134
+// GDRST bit1 (GEN11_GRDOM_RENDER) resets them, and neither _rcsResetRegisters (32) nor _ccsResetRegisters (4: HWS_PGA,
+// INSTPM, MI_MODE, GFX_MODE) contains them. After ANY render-domain reset (RCS by Apple, CCS by Apple, or our sibling
+// path) the CCS is left disabled: ELSP writes produce no CSB event, IGHardwareCommandStreamer5 never flips its port, so
+// getActiveContexts() is empty -> IGAccelEventMachine::eventTimeout returns NULL -> IOAF "no channel associated with
+// stamp_idx 24..31" forever; or, when the CCS itself is restarted, the post-reset stamp test times out every time.
+// Fix: snapshot them before the reset, and re-apply them right after GDRST, BEFORE any replay touches ELSP (the own
+// engine's replay runs inside Apple's resetGraphicsEngine, so it is done from an IGScheduler5::processGPUReset wrapper).
+// CCS RING_IMR 0x1a0a8 / RING_HWSTAM 0x1a098 are engine registers also missing from the CCS list (RCS list has
+// CONTROL_IMR 0x20a8); they are restored to their pre-reset values only if the reset changed them.
+static const uint32_t kXeRecEx[5] = {0x14800, 0xce90, 0x1a4d0, 0x1a0a8, 0x1a098};
+static const bool kXeRecExMasked[5] = {true, true, false, false, false};
+static uint32_t gRecExSnap[5], gRecExGood[5];
+static bool gRecExSnapOk = false, gRecExGoodOk = false;
+static mach_vm_address_t gOrgS5Proc = 0;
+static int gRecExOn = 0;
+static void *volatile gRecPendAcc = nullptr;
+static volatile uint8_t *volatile gRecPendMmio = nullptr;
+static volatile uint32_t gRecExFix = 0, gRecExLastRcu = 0xffffffffu;
+
+static inline uint32_t xeRecCcsOn(void *acc) {
+	return (uint32_t)((*reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(acc) + 0x1190) >> 33) & 1);
+}
+static void xeRecExSnapshot(void *acc, volatile uint8_t *mmio) {
+	uint32_t v[5];
+	for (int i = 0; i < 5; i++) v[i] = xeRecRd(mmio, kXeRecEx[i]);
+	// only trust a snapshot taken while the domain was healthy (RCU_MODE matches what startGraphicsEngine programmed)
+	gRecExSnapOk = (v[0] & 1) == xeRecCcsOn(acc);
+	if (gRecExSnapOk) {
+		for (int i = 0; i < 5; i++) gRecExSnap[i] = gRecExGood[i] = v[i];
+		gRecExGoodOk = true;
+	}
+}
+// Idempotent: writes only registers whose live value differs from the healthy one. Returns a bitmask of what it wrote.
+static uint32_t xeRecExFix(void *acc, volatile uint8_t *mmio) {
+	if (gRecExOn != 1 || !acc || !mmio) return 0;
+	uint32_t did = 0, on = xeRecCcsOn(acc), rcu = xeRecRd(mmio, kXeRecEx[0]);
+	gRecExLastRcu = rcu;
+	if ((rcu & 1) != on) { xeRecWr(mmio, kXeRecEx[0], 0x10000u | on); did |= 1; }   // exactly Apple's initModeRegisters write
+	const uint32_t *src = gRecExSnapOk ? gRecExSnap : (gRecExGoodOk ? gRecExGood : nullptr);
+	if (src) for (int i = 1; i < 5; i++) {
+		if (i == 2 && !on) continue;                       // CCS whitelist only matters with CCS enabled
+		uint32_t cur = xeRecRd(mmio, kXeRecEx[i]);
+		if (kXeRecExMasked[i] ? ((cur & 0xffff) == (src[i] & 0xffff)) : (cur == src[i])) continue;
+		xeRecWr(mmio, kXeRecEx[i], kXeRecExMasked[i] ? (0xffff0000u | (src[i] & 0xffff)) : src[i]);
+		did |= 1u << i;
+	}
+	if (did) { (void)xeRecRd(mmio, kXeRecEx[0]); gRecExFix++; }
+	return did;
+}
+// IGScheduler5::processGPUReset is called by resetGraphicsEngine right after GDRST + list restore (file 0x43842) and by
+// our sibling replay. Re-enable the CCS before Apple resubmits to ELSP.
+static void xeRecProc(void *sched, uint32_t type, void *ctx) {
+	auto orig = FunctionCast(xeRecProc, gOrgS5Proc);
+	if (gRecPendAcc && gRecPendMmio) xeRecExFix(gRecPendAcc, gRecPendMmio);
+	orig(sched, type, ctx);
+}
+
+static bool xeRecResetGraphicsEngine(void *ring, void *ctx) {
+	auto orig = FunctionCast(xeRecResetGraphicsEngine, gOrgRge);
+	auto *r = static_cast<uint8_t *>(ring);
+	if (gRecOn != 1 || !r) return orig(ring, ctx);
+	auto *acc = *reinterpret_cast<uint8_t **>(r + 0x10);
+	auto *mmio = *reinterpret_cast<volatile uint8_t **>(r + 0x50);
+	uint32_t mask = *reinterpret_cast<uint32_t *>(r + 0x70);
+	mach_vm_address_t ownList = *reinterpret_cast<mach_vm_address_t *>(r + 0x78);
+	uint8_t type = r[0x40];
+	int own = ownList == gRecList[0] ? 0 : ownList == gRecList[1] ? 1 : -1;
+	if (!acc || !mmio || !(mask & 2) || own < 0 || type != (uint8_t)own) return orig(ring, ctx);
+	int sib = 1 - own;
+	uint64_t sn = 0, on = 0; uint8_t *sd = nullptr, *od = nullptr;
+	if (!xeRecList(sib, sn, sd) || !xeRecList(own, on, od)) return orig(ring, ctx);
+
+	auto sfw = reinterpret_cast<void (*)(void *, bool, uint32_t)>(gRecSfw);
+	sfw(acc, true, 7);  // hold render/media/GT across the whole reset (Apple takes and drops its own inside)
+	uint32_t snap[64], osnap[64];
+	for (uint64_t i = 0; i < sn; i++) snap[i] = xeRecRd(mmio, xeRecReg(sd, i));
+	for (uint64_t i = 0; i < on; i++) osnap[i] = xeRecRd(mmio, xeRecReg(od, i));
+	if (snap[0]) { for (uint64_t i = 0; i < sn; i++) gRecGood[sib][i] = snap[i]; gRecGoodOk[sib] = true; }
+	if (osnap[0]) { for (uint64_t i = 0; i < on; i++) gRecGood[own][i] = osnap[i]; gRecGoodOk[own] = true; }
+	// resetGraphicsEngine's "ring wait" path (engine flags 0x4/0x8 at ring->0x8b8[type]+0xa4) only kicks RING_CTL and may
+	// not reach GDRST; then only act if the sibling visibly lost its state.
+	auto *eng = *reinterpret_cast<uint8_t **>(r + 0x8b8 + (uint64_t)type * 8);
+	bool kick = eng && (*reinterpret_cast<uint32_t *>(eng + 0xa4) & 0xc);
+
+	xeRecExSnapshot(acc, mmio);
+	gRecPendAcc = acc; gRecPendMmio = mmio;     // xeRecProc() re-applies the extras between GDRST and Apple's replay
+	bool ret = orig(ring, ctx);
+	gRecPendAcc = nullptr; gRecPendMmio = nullptr;
+	uint32_t exDid = xeRecExFix(acc, mmio);   // no-op if xeRecProc already did it
+
+	uint32_t sibHws = xeRecRd(mmio, xeRecReg(sd, 0));
+	bool lost = snap[0] ? (sibHws == 0) : true;
+	bool gdrst = !kick || (snap[0] && sibHws == 0);
+	gRecResets++;
+	uint32_t did = 0;
+	if (ret && gdrst && lost) {
+		const uint32_t *src = snap[0] ? snap : (gRecGoodOk[sib] ? gRecGood[sib] : snap);
+		xeRecWriteList(acc, mmio, sd, sn, src);
+		gRecSibRestores++; did |= 1;
+		// own engine: Apple restored from what it saved; if that was already broken (HWS_PGA 0), use the known-good copy
+		if (xeRecRd(mmio, xeRecReg(od, 0)) == 0 && gRecGoodOk[own]) {
+			xeRecWriteList(acc, mmio, od, on, gRecGood[own]);
+			gRecOwnFix++; did |= 2;
+		}
+		// replay the sibling: IGScheduler5::processGPUReset(type, ctx) -> IGHardwareCommandStreamer5::processGPUReset
+		auto *sched = *reinterpret_cast<uint8_t **>(acc + 0x1250);
+		auto *vt = sched ? *reinterpret_cast<mach_vm_address_t **>(sched) : nullptr;
+		auto *cs = sched ? *reinterpret_cast<uint8_t **>(sched + 0xca0 + (uint64_t)sib * 8) : nullptr;
+		auto *desc = cs ? *reinterpret_cast<uint8_t **>(cs + 0x28) : nullptr;
+		if (vt && vt[0x190 / 8] == gRecS5Proc && desc && desc[0] == (uint8_t)sib) {
+			reinterpret_cast<void (*)(void *, uint32_t, void *)>(gRecS5Proc)(sched, (uint32_t)sib, nullptr);
+			gRecSibReplays++; did |= 4;
+		}
+	} else if (kick && !gdrst) {
+		gRecSkipKick++;
+	}
+	if (exDid) did |= 8;
+	sfw(acc, false, 7);
+	gRecLast = (uint32_t)own | ((uint32_t)ret << 4) | ((uint32_t)kick << 5) | (did << 8) | ((snap[0] >> 12) << 12);
+	xeEv('GREC', gRecLast, snap[0], sibHws);
+	if (gRecResets <= 32)
+		IOLog("XeNG GPUREC: reset %s ret=%d kick=%d sibHWS %x->%x restore=%d ownfix=%d replay=%d (n=%u)\n", own ? "CCS" : "RCS",
+		      ret, kick, snap[0], sibHws, !!(did & 1), !!(did & 2), !!(did & 4), gRecResets);
+	auto *svc = reinterpret_cast<IOService *>(acc);
+	svc->setProperty("xe-rec-resets", gRecResets, 32);
+	svc->setProperty("xe-rec-sibrestores", gRecSibRestores, 32);
+	svc->setProperty("xe-rec-sibreplays", gRecSibReplays, 32);
+	svc->setProperty("xe-rec-ownfix", gRecOwnFix, 32);
+	svc->setProperty("xe-rec-last", gRecLast, 32);
+	svc->setProperty("xe-rec-exfix", gRecExFix, 32);
+	svc->setProperty("xe-rec-rcu", gRecExLastRcu, 32);    // RCU_MODE seen right after the last reset (bit0 0 = CCS was off)
+	return ret;
+}
+
+// Route installer (called from processKext). All addresses are runtime; every assumption is checked by bytes first.
+static void xeGpuRecInstall(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (checkKernelArgument("-ngreennogpurec")) { SYSLOG("ngreen", "XE-GPUREC: off (-ngreennogpurec)"); return; }
+	mach_vm_address_t rge = patcher.solveSymbol(index, "__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", address, size);
+	patcher.clearError();
+	gRecSfw = patcher.solveSymbol(index, "__ZN16IntelAccelerator13SafeForceWakeEbj", address, size); patcher.clearError();
+	gRecGetDef = patcher.solveSymbol(index, "__ZN16IntelAccelerator20getDefaultResetValueEj", address, size); patcher.clearError();
+	gRecS5Proc = patcher.solveSymbol(index, "__ZN12IGScheduler515processGPUResetE10IGHwCsTypeP17IGHardwareContext", address, size); patcher.clearError();
+	mach_vm_address_t cs5Proc = patcher.solveSymbol(index, "__ZN26IGHardwareCommandStreamer515processGPUResetEv", address, size); patcher.clearError();
+	gRecList[0] = patcher.solveSymbol(index, "_rcsResetRegisters", address, size); patcher.clearError();
+	gRecList[1] = patcher.solveSymbol(index, "_ccsResetRegisters", address, size); patcher.clearError();
+	auto has = [](mach_vm_address_t f, size_t len, const uint8_t *p, size_t n) {
+		if (!f) return false;
+		auto *b = reinterpret_cast<const uint8_t *>(f);
+		for (size_t i = 0x10; i + n <= len; i++) if (!memcmp(b + i, p, n)) return true;  // skip the entry (route jump)
+		return false;
+	};
+	// movl $0x40004,0x4a08(%rax); movl 0x70(%r12),%ecx; movl %ecx,0x941c(%rax)
+	static const uint8_t sGdrst[] = {0xc7, 0x80, 0x08, 0x4a, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0x41, 0x8b, 0x4c, 0x24, 0x70, 0x89, 0x88, 0x1c, 0x94, 0x00, 0x00};
+	// movzbl 0x40(%r12),%esi; movq (%rdi),%rax; movq -0x30(%rbp),%rdx; callq *0x190(%rax)   (sched->processGPUReset(type, ctx))
+	static const uint8_t sProc[] = {0x41, 0x0f, 0xb6, 0x74, 0x24, 0x40, 0x48, 0x8b, 0x07, 0x48, 0x8b, 0x55, 0xd0, 0xff, 0x90, 0x90, 0x01, 0x00, 0x00};
+	// movzbl 0x40(%r12),%eax; movq 0x8b8(%r12,%rax,8),%rax; movl 0xa4(%rax),%ecx
+	static const uint8_t sFlags[] = {0x41, 0x0f, 0xb6, 0x44, 0x24, 0x40, 0x49, 0x8b, 0x84, 0xc4, 0xb8, 0x08, 0x00, 0x00, 0x8b, 0x88, 0xa4, 0x00, 0x00, 0x00};
+	// IGScheduler5::processGPUReset: movl %esi,%eax; movq 0xca0(%rdi,%rax,8),%rdi
+	static const uint8_t sS5[] = {0x89, 0xf0, 0x48, 0x8b, 0xbc, 0xc7, 0xa0, 0x0c, 0x00, 0x00};
+	// IGHardwareCommandStreamer5::processGPUReset: movl $7,%eax; movl %eax,0x1c04(%rdi)
+	static const uint8_t sCs5[] = {0xb8, 0x07, 0x00, 0x00, 0x00, 0x89, 0x87, 0x04, 0x1c, 0x00, 0x00};
+	bool sig1 = has(rge, 0x320, sGdrst, sizeof(sGdrst)), sig2 = has(rge, 0x320, sProc, sizeof(sProc)),
+	     sig3 = has(rge, 0x320, sFlags, sizeof(sFlags));
+	bool sig4 = false;
+	if (gRecS5Proc) sig4 = !memcmp(reinterpret_cast<const uint8_t *>(gRecS5Proc) + 4, sS5, sizeof(sS5));
+	bool sig5 = has(cs5Proc, 0x40, sCs5, sizeof(sCs5)) || (cs5Proc && !memcmp(reinterpret_cast<const uint8_t *>(cs5Proc) + 0xe, sCs5, sizeof(sCs5)));
+	uint64_t n0 = 0, n1 = 0; uint8_t *d0 = nullptr, *d1 = nullptr;
+	// the lists are filled by the static constructors of the TGL kext, which ran before processKext; check them now
+	bool l0 = xeRecList(0, n0, d0), l1 = xeRecList(1, n1, d1);
+	bool ok = rge && gRecSfw && gRecGetDef && gRecS5Proc && sig1 && sig2 && sig3 && sig4 && sig5;
+	// IntelAccelerator::initModeRegisters @0x28e7e: movl $0xfffefffe,%ecx; andl 0x14800(%rax),%ecx; movq 0x1190(%rdi),%rdx;
+	// shrq $0x21,%rdx; andl $1,%edx; leal 0x10000(%rcx,%rdx),%ecx; movl %ecx,0x14800(%rax)
+	static const uint8_t sRcu[] = {0xb9, 0xfe, 0xff, 0xfe, 0xff, 0x23, 0x88, 0x00, 0x48, 0x01, 0x00, 0x48, 0x8b, 0x97, 0x90, 0x11, 0x00, 0x00,
+	                               0x48, 0xc1, 0xea, 0x21, 0x83, 0xe2, 0x01, 0x8d, 0x8c, 0x11, 0x00, 0x00, 0x01, 0x00, 0x89, 0x88, 0x00, 0x48, 0x01, 0x00};
+	// ... movl $0xb134,0x1a4d0(%rax)
+	static const uint8_t sNp[] = {0xc7, 0x80, 0xd0, 0xa4, 0x01, 0x00, 0x34, 0xb1, 0x00, 0x00};
+	mach_vm_address_t imr = patcher.solveSymbol(index, "__ZN16IntelAccelerator17initModeRegistersEv", address, size); patcher.clearError();
+	bool sig6 = has(imr, 0x120, sRcu, sizeof(sRcu)) && has(imr, 0x120, sNp, sizeof(sNp));
+	if (ok) {
+		RouteRequestPlus rec[] = {
+			{"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", xeRecResetGraphicsEngine, gOrgRge},
+		};
+		if (RouteRequestPlus::routeAll(patcher, index, rec, address, size)) gRecOn = 1;
+		else patcher.clearError();
+		// second route only if the first one is in and initModeRegisters matches; off with -ngreennogpurecex
+		if (gRecOn == 1 && sig6 && !checkKernelArgument("-ngreennogpurecex")) {
+			RouteRequestPlus rec2[] = {
+				{"__ZN12IGScheduler515processGPUResetE10IGHwCsTypeP17IGHardwareContext", xeRecProc, gOrgS5Proc},
+			};
+			if (RouteRequestPlus::routeAll(patcher, index, rec2, address, size) && gOrgS5Proc) gRecExOn = 1;
+			else patcher.clearError();
+		}
+	}
+	SYSLOG("ngreen", "XE-GPUREC: sym rge=%d sfw=%d def=%d s5=%d cs5=%d lists=%d/%d(n=%llu/%llu) sig=%d%d%d%d%d%d route=%d ex=%d",
+	       rge != 0, gRecSfw != 0, gRecGetDef != 0, gRecS5Proc != 0, cs5Proc != 0, l0, l1, n0, n1, sig1, sig2, sig3, sig4, sig5, sig6, gRecOn, gRecExOn);
+}
+
+// ─── xe/blitfix (23/10): IOSurface copies whose linear row pitch is not a multiple of 64 bytes ────────────────────────
+// A Metal texture over an IOSurface is never used in place: IGAccelResource pageon/pageoff copy between the IOSurface
+// pages (linear) and the Y-tiled device cache with IntelAccelerator::submitBlit (16.0.32, file 0x2bc8e). Routing there:
+//   blit2d_supported (0x300f4 -> blit2d_common_supported 0x3011e) accepts linear pitch % 4 == 0 && <= 0x7ffe;
+//   blit2d_fast_supported (0x302e6) needs pitch & 0x3f == 0 when src/dst tiling differ (mask 0x3f at 0x30370);
+//   if blit3d_supported && !fast, the block at 0x2c228 sends the copy to Blit3D (0x2bd28) when
+//   area*bpp >= 0x20001 (0x51001 for bpp 16), otherwise to blt2d_source_copy (XY_SRC_COPY_BLT, BCS).
+// Blit3D produces nothing here, so an IOSurface with bytesPerRow 656 (R8 642 px) reads as zeros / loses GPU writes once
+// it is larger than 128 KB, while the same surface below 128 KB is correct (XY_SRC_COPY_BLT takes 16-byte pitch).
+// BLITALIGN v2 already rewrote 0x2c228 to divert ((src|dst base) & 0x3f) != 0. This replaces that block with a call to
+// xeBlitFixRoute(params, pixelArea, accel), which keeps the original thresholds and the v2 rule and adds
+// ((srcPitch|dstPitch) & 0x3f) != 0 -> 2D. Copies with 64-aligned base and pitch still go to Blit3D exactly as before.
+// Counters (ioreg -rc IntelAccelerator | grep xe-blitfix) are published from a thread_call, never from submitBlit.
+static volatile uint32_t gBfPitch = 0, gBfBase = 0, gBf3D = 0, gBfLast = 0;
+static void *volatile gBfAcc = nullptr;
+static thread_call_t volatile gBfTc = nullptr;
+
+static void xeBlitFixPublish(thread_call_param_t, thread_call_param_t) {
+	auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gBfAcc));
+	if (!svc) return;
+	svc->setProperty("xe-blitfix-pitch", gBfPitch, 32);   // large copies sent to XY_SRC_COPY because of the pitch (new)
+	svc->setProperty("xe-blitfix-base", gBfBase, 32);     // same, because of the base address (BLITALIGN v2 rule)
+	svc->setProperty("xe-blitfix-3d", gBf3D, 32);         // large non-fast copies still left on Blit3D (64-aligned)
+	svc->setProperty("xe-blitfix-last", gBfLast, 32);     // last pitch diversion: srcPitch<<16 | dstPitch (low 16 bits)
+}
+
+static void xeBlitFixNote(void *acc) {
+	gBfAcc = acc;   // gBfTc is allocated once in xeBlitFixInstall (no allocation inside submitBlit)
+	if (gBfTc) thread_call_enter(gBfTc);   // coalesces if already pending
+}
+
+// Called from the patched block (rdi = blit3d_params_t*, rsi = sum of rect w*h, rdx = IntelAccelerator*).
+// true -> blt2d_source_copy, false -> Blit3D. Must stay cheap: runs for every large non-fast copy.
+static bool xeBlitFixRoute(const uint8_t *p, uint64_t px, void *acc) {
+	const uint32_t bpp = p[0xa0];
+	const uint64_t bytes = px * bpp;
+	if (bytes < (bpp == 16 ? 0x51001ULL : 0x20001ULL)) return true;     // original 0x2c228..0x2c25f
+	const uint32_t sb = *reinterpret_cast<const uint32_t *>(p) + *reinterpret_cast<const uint32_t *>(p + 0x2c);
+	const uint32_t db = *reinterpret_cast<const uint32_t *>(p + 0x48) + *reinterpret_cast<const uint32_t *>(p + 0x74);
+	if ((sb | db) & 0x3f) {                                               // BLITALIGN v2
+		uint32_t n = OSIncrementAtomic(&gBfBase) + 1;
+		if (!(n & (n - 1))) xeBlitFixNote(acc);
+		return true;
+	}
+	const uint32_t sp = *reinterpret_cast<const uint32_t *>(p + 0x8), dp = *reinterpret_cast<const uint32_t *>(p + 0x50);
+	if ((sp | dp) & 0x3f) {                                               // new: pitch not 64-aligned
+		uint32_t n = OSIncrementAtomic(&gBfPitch) + 1;
+		gBfLast = (sp << 16) | (dp & 0xffff);
+		if (n <= 8) IOLog("XeNG BLITFIX #%u: pitch %u->%u tiling %u->%u bpp %u bytes %llu -> XY_SRC_COPY\n",
+		                  n, sp, dp, p[0xc], p[0x54], bpp, bytes);
+		if (!(n & (n - 1))) xeBlitFixNote(acc);   // 1, 2, 4, 8, ... : rare
+		return true;
+	}
+	uint32_t n = OSIncrementAtomic(&gBf3D) + 1;
+	if (!(n & (n - 1))) xeBlitFixNote(acc);
+	return false;
+}
+
+// v2 = BLITALIGN v2's 60-byte block at submitBlit+0x59a (0x2c228), as it is in memory after BLITALIGN applied it.
+// New block (same 60 bytes; branch targets are relative to the block start, identical to the ones v2 encodes):
+//   +0  4c 89 f7            mov  rdi, r14            ; blit3d_params_t*
+//   +3  48 89 d6            mov  rsi, rdx            ; sum of w*h
+//   +6  48 8b 55 c0         mov  rdx, [rbp-0x40]     ; IntelAccelerator* (stored at 0x2bd06)
+//   +10 48 b8 <imm64>       movabs rax, xeBlitFixRoute
+//   +20 ff d0               call rax                 ; stack is 16-aligned here (6 pushes + sub 0x38)
+//   +22 84 c0               test al, al
+//   +24 0f 84 e2 fa ff ff   je   Blit3D (0x2bd28)     ; same target as v2's je
+//   +30 be 01 00 00 00      mov  esi, 1               ; != 2 -> blt2d_source_copy (as the original 0x2c245)
+//   +35 eb d4               jmp  0x2c221 (jmp 0x2bf0c) ; same target as v2's "eb be"
+//   +37 cc x 23
+// Only caller-saved registers are clobbered; all of them are dead at both targets.
+static bool xeBlitFixInstall(KernelPatcher &patcher, KernelPatcher::KextInfo *kext, mach_vm_address_t address, size_t size, const uint8_t *v2, size_t v2Size) {
+	if (!gBfTc) gBfTc = thread_call_allocate(xeBlitFixPublish, nullptr);
+	static uint8_t blk[60];
+	if (v2Size != sizeof(blk)) return false;
+	// v2 must still be the BLITALIGN v2 block with its two branches where this code expects them
+	static const uint8_t v2je[] = {0x0f, 0x84, 0xc7, 0xfa, 0xff, 0xff, 0xeb, 0xbe};
+	if (memcmp(v2 + 51, v2je, sizeof(v2je)) != 0) return false;
+	static const uint8_t head[] = {0x4c, 0x89, 0xf7, 0x48, 0x89, 0xd6, 0x48, 0x8b, 0x55, 0xc0, 0x48, 0xb8};
+	static const uint8_t tail[] = {0xff, 0xd0, 0x84, 0xc0, 0x0f, 0x84, 0xe2, 0xfa, 0xff, 0xff, 0xbe, 0x01, 0x00, 0x00, 0x00, 0xeb, 0xd4};
+	memset(blk, 0xcc, sizeof(blk));
+	memcpy(blk, head, sizeof(head));
+	uint64_t fn = reinterpret_cast<uint64_t>(&xeBlitFixRoute);
+	memcpy(blk + 12, &fn, sizeof(fn));
+	memcpy(blk + 20, tail, sizeof(tail));
+	LookupPatchPlus const p[] = {{kext, v2, blk, sizeof(blk), 1}};
+	return LookupPatchPlus::applyAll(patcher, p, address, size);
+}

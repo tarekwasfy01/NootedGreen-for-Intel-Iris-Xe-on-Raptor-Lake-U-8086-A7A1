@@ -351,6 +351,113 @@ void NGreen::setApertureIfNecessary() {
 // has returned (and thus the GFX interrupt handler is installed). Without this, stamp 3 is
 // submitted during FB init while the GFX kext hasn't started yet; the interrupt fires but sits
 // unserviced for 5s, causing CoreDisplay_CreateDisplayForCGXDisplayDevice to assert.
+// xe/pool (19/10): o batch do blit3d passa do fim do buffer do IOAccelCommandBufferPool2 (getBufferPtrNoInc do Tahoe
+// submete o buffer pela metade quando falta espaço) e a GPU lê a página seguinte ainda com veneno 0xc01dbead.
+// O TGL pede até 0x3ffe dwords de uma vez. Aqui: registra cada pool criado (quantidade, tamanho, reserva, chamador) e,
+// com -ngreenxefix, garante pelo menos 128 KB por buffer (desliga com -ngreennopoolfix).
+static mach_vm_address_t orgPoolInit = 0;
+static bool wrapPoolInit(void *that, void *accel, void *channel, void *task, int count, int bufSize, uint32_t a,
+						 uint32_t b, uint32_t c, uint32_t reserve) {
+	static int fixArg = -1, nlog = 0;
+	if (fixArg < 0) fixArg = (checkKernelArgument("-ngreenxefix") && !checkKernelArgument("-ngreennopoolfix")) ? 1 : 0;
+	int novo = bufSize;
+	// 20/10: 256 buffers x 128 KB = 32 MB por pool (um por processo) esgotava a área de endereços dos buffers de comando:
+	// hang com o batch continuando numa página "scratch" (0xc01dbead) em 40c2a000. Só os pools pequenos (o do blit3d do
+	// kernel, count=8) ficam com 128 KB; os grandes sobem de 4 KB para 16 KB e os de 64 KB não mudam.
+	if (fixArg == 1 && bufSize > 0) {
+		if (count <= 16) { if (bufSize < 0x20000) novo = 0x20000; }
+		else if (bufSize < 0x4000) novo = 0x4000;
+	}
+	if (nlog < 40) {
+		nlog++;
+		IOLog("XeNG POOL[%d] init count=%d size=0x%x->0x%x a=0x%x b=0x%x c=0x%x reserve=0x%x caller=%p\n", nlog, count,
+			  bufSize, novo, a, b, c, reserve, __builtin_return_address(0));
+	}
+	return FunctionCast(wrapPoolInit, orgPoolInit)(that, accel, channel, task, count, novo, a, b, c, reserve);
+}
+
+// xe/pool (19/10): o blit3d do TGL calcula a posição do estado (surface states, binding table) supondo que o
+// comando começa num múltiplo de 64 bytes. No Tahoe o blit vem logo depois do init do contexto, em 0x...9b8, e o
+// estado sai 0x18 bytes deslocado: a GPU lê a binding table vazia e o desenho nunca termina. Antes de reservas
+// grandes (>= 0x400 dwords, as do blit3d), completa o buffer com MI_NOOP até o próximo múltiplo de 64.
+// Campos do pool: 0x1842 índice atual, 0x40 + 24*i base da CPU do buffer i, 0x1850 limite, 0x1858 ponteiro atual.
+static mach_vm_address_t orgPoolGetPtr = 0;
+static void *wrapPoolGetPtr(void *that, uint32_t ndw) {
+	static int fixArg = -1, nlog = 0;
+	if (fixArg < 0) fixArg = (checkKernelArgument("-ngreenxefix") && !checkKernelArgument("-ngreennopoolfix")) ? 1 : 0;
+	if (fixArg == 1 && ndw >= 0x400) {
+		auto *p = static_cast<uint8_t *>(that);
+		int16_t idx = *reinterpret_cast<int16_t *>(p + 0x1842);
+		if (idx >= 0) {
+			uint64_t base = *reinterpret_cast<uint64_t *>(p + 0x40 + 24 * idx);
+			uint64_t cur = *reinterpret_cast<uint64_t *>(p + 0x1858);
+			uint64_t lim = *reinterpret_cast<uint64_t *>(p + 0x1850);
+			uint64_t pad = (0 - (cur - base)) & 0x3f;
+			if (base && cur >= base && pad && cur + pad + 4ULL * ndw <= lim) {
+				bzero(reinterpret_cast<void *>(cur), pad);
+				*reinterpret_cast<uint64_t *>(p + 0x1858) = cur + pad;
+				if (nlog < 16) {
+					nlog++;
+					IOLog("XeNG POOLALIGN[%d] ndw=0x%x off=0x%llx pad=0x%llx\n", nlog, ndw, cur - base, pad);
+				}
+			}
+		}
+	}
+	return FunctionCast(wrapPoolGetPtr, orgPoolGetPtr)(that, ndw);
+}
+
+// xe/flipdiag (19/10): lado do IOAF2 — quantas vezes a interrupção de transação (vblank) e o timer de timeout
+// chegam a rodar, e quantas transações são concluídas.
+static mach_vm_address_t orgDpTxIrq = 0, orgDpTxTimeout = 0, orgDpComplete = 0, orgDpQueue = 0;
+static volatile uint32_t dpTxIrqN = 0, dpTxTimeoutN = 0, dpCompleteN = 0, dpQueueN = 0;
+static uint64_t wrapDpTxIrq(void *that) {
+	uint32_t n = ++dpTxIrqN;
+	if (n <= 24 || !(n & 4095)) IOLog("XeNG FLIP txIrq #%u (queue %u complete %u timeout %u)\n", n, dpQueueN, dpCompleteN, dpTxTimeoutN);
+	return FunctionCast(wrapDpTxIrq, orgDpTxIrq)(that);
+}
+static uint64_t wrapDpTxTimeout(void *that, void *timer) {
+	uint32_t n = ++dpTxTimeoutN;
+	if (n <= 24 || !(n & 63)) IOLog("XeNG FLIP txTimeout #%u (queue %u complete %u irq %u)\n", n, dpQueueN, dpCompleteN, dpTxIrqN);
+	return FunctionCast(wrapDpTxTimeout, orgDpTxTimeout)(that, timer);
+}
+static uint64_t wrapDpComplete(void *that, void *t) {
+	uint32_t n = ++dpCompleteN;
+	if (n <= 24 || !(n & 1023)) IOLog("XeNG FLIP complete #%u (queue %u)\n", n, dpQueueN);
+	return FunctionCast(wrapDpComplete, orgDpComplete)(that, t);
+}
+static uint64_t wrapDpQueue(void *that, void *t) {
+	uint32_t n = ++dpQueueN;
+	uint64_t r = FunctionCast(wrapDpQueue, orgDpQueue)(that, t);
+	if (n <= 24 || !(n & 1023)) IOLog("XeNG FLIP queue #%u ret=0x%x (complete %u)\n", n, (uint32_t)r, dpCompleteN);  // 19/10: era 1 linha por flip (ret nunca é 0)
+	return r;
+}
+
+// xe/blitscratch2 (19/10): o scratch dos kernels blit3d ficava zerado. blit3d_initialize_scratch_space escreve pelo
+// ponteiro de IOAccelSysMemory::lockForCPUAccess. Para UM objeto (gXeBlitMem, só durante a chamada feita pelo Gen11), o
+// lock devolve gXeBlitCpu = CPU VA do IGSharedMappedBuffer que a GPU lê, e o unlock vira no-op.
+void *volatile gXeBlitMem = nullptr, *volatile gXeBlitCpu = nullptr;
+bool gXeLockRouted = false;
+static mach_vm_address_t orgLockCpu = 0, orgUnlockCpu = 0;
+static void *wrapLockCpu(void *that, void *task, uint32_t opt) {
+	if (that && that == gXeBlitMem && gXeBlitCpu) return gXeBlitCpu;
+	return FunctionCast(wrapLockCpu, orgLockCpu)(that, task, opt);
+}
+static uint64_t wrapUnlockCpu(void *that, void *task) {
+	if (that && that == gXeBlitMem && gXeBlitCpu) return 0;
+	return FunctionCast(wrapUnlockCpu, orgUnlockCpu)(that, task);
+}
+// xe/noorphan (20/10): pânico "corrupt list" no iconservicesagent em IOAccelSysMemory::unorphanIt <-
+// IOAccelOrphanedMemoryPool::getMemory <- IOAccelResource2::newResourceWithOptions <- new_resource. O pool de órfãos
+// guarda a memória de recursos liberados para reuso; com o driver TGL (eventos/ABI de outra geração) a lista corrompe
+// e memória reaproveitada pode ainda estar em uso pela GPU. getMemory -> nullptr = sempre aloca memória nova (o pool
+// segue sendo podado pelo próprio IOAcceleratorFamily2). -ngreenorphanreuse desliga.
+volatile uint32_t gXeOrphanMiss = 0;
+static mach_vm_address_t orgOrphanGet = 0;
+static void *wrapOrphanGet(void *that, void *shared, void *res, uint64_t size, void *opt) {
+	(void)that; (void)shared; (void)res; (void)size; (void)opt;
+	gXeOrphanMiss++;
+	return nullptr;
+}
 static mach_vm_address_t orgWaitForStamp = 0;
 static IOReturn wrapWaitForStamp(void *that, int32_t channel, unsigned int stamp, unsigned int *outStamp) {
 	IOReturn ret = FunctionCast(wrapWaitForStamp, orgWaitForStamp)(that, channel, stamp, outStamp);
@@ -468,6 +575,52 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		} else {
 			patcher.clearError();
 			SYSLOG("ngreen", "V221: waitForStamp hook FAILED — symbol not found");
+		}
+
+		// xe/blitscratch2: lock/unlock do IOAccelSysMemory (ver wrapLockCpu)
+		if (checkKernelArgument("-ngreenxefix") && !checkKernelArgument("-ngreennoblitscratch")) {
+			RouteRequestPlus lockRequest[] = {
+				{"__ZN16IOAccelSysMemory16lockForCPUAccessEP4taskj", wrapLockCpu, orgLockCpu},
+				{"__ZN16IOAccelSysMemory18unlockForCPUAccessEP4task", wrapUnlockCpu, orgUnlockCpu},
+			};
+			gXeLockRouted = RouteRequestPlus::routeAll(patcher, index, lockRequest, address, size);
+			if (!gXeLockRouted) patcher.clearError();
+			IOLog("XeNG BLITSCRATCH2: lock/unlockForCPUAccess %s\n", gXeLockRouted ? "hooked" : "NAO encontrados");
+		}
+
+		if (checkKernelArgument("-ngreenxefix") && !checkKernelArgument("-ngreenorphanreuse")) {
+			RouteRequestPlus orphanRequest[] = {
+				{"__ZN25IOAccelOrphanedMemoryPool9getMemoryEP14IOAccelShared2P16IOAccelResource2yPv", wrapOrphanGet, orgOrphanGet},
+			};
+			bool ok = RouteRequestPlus::routeAll(patcher, index, orphanRequest, address, size);
+			if (!ok) patcher.clearError();
+			IOLog("XeNG NOORPHAN: IOAccelOrphanedMemoryPool::getMemory -> sem reuso: %s\n", ok ? "hooked" : "NAO encontrado");
+		}
+
+		// xe/pool: tamanho mínimo dos buffers de comando (ver wrapPoolInit).
+		RouteRequestPlus poolRequest[] = {
+			{"__ZN25IOAccelCommandBufferPool24initEP22IOGraphicsAccelerator2P15IOAccelChannel2P11IOAccelTaskiijjjj",
+			 wrapPoolInit, orgPoolInit},
+			{"__ZN25IOAccelCommandBufferPool217getBufferPtrNoIncEj", wrapPoolGetPtr, orgPoolGetPtr},
+		};
+		if (RouteRequestPlus::routeAll(patcher, index, poolRequest, address, size)) {
+			IOLog("XeNG POOL: hook IOAccelCommandBufferPool2::init OK\n");
+		} else {
+			patcher.clearError();
+			IOLog("XeNG POOL: hook IOAccelCommandBufferPool2::init FALHOU\n");
+		}
+
+		// xe/flipdiag: contadores do caminho de conclusão das transações de display
+		RouteRequestPlus dpRequest[] = {
+			{"__ZN18IOAccelDisplayPipe27transaction_interrupt_gatedEv", wrapDpTxIrq, orgDpTxIrq},
+			{"__ZN18IOAccelDisplayPipe31transaction_timeout_timer_firedEP18IOTimerEventSource", wrapDpTxTimeout, orgDpTxTimeout},
+			{"__ZN18IOAccelDisplayPipe19completeTransactionEP30IOAccelDisplayPipeTransaction2", wrapDpComplete, orgDpComplete},
+			{"__ZN18IOAccelDisplayPipe23transaction_queue_gatedEP30IOAccelDisplayPipeTransaction2", wrapDpQueue, orgDpQueue},
+		};
+		if (checkKernelArgument("-ngreenxefix")) {
+			bool ok = RouteRequestPlus::routeAll(patcher, index, dpRequest, address, size);
+			if (!ok) patcher.clearError();
+			IOLog("XeNG FLIP diag IOAF2 hooks: %s\n", ok ? "OK" : "FALHOU");
 		}
 
 		// V500: IOAccelLegacySurface::set_id_mode — diagnostic logger.
