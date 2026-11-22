@@ -10,6 +10,7 @@ Download the tools PKG from the release into Downloads. Inspect its signature, c
 
 ```sh
 cd "$HOME/Downloads"
+shasum -a 256 -c SHA256SUMS
 pkgutil --check-signature HP250-Graphics-Installer-Tools-v32.pkg &&
 sudo installer -pkg HP250-Graphics-Installer-Tools-v32.pkg -target /
 ```
@@ -23,10 +24,19 @@ Use Xcode Command Line Tools and Python 3.9 or later. On the already working HP,
 ```sh
 python3 "/Library/Application Support/HP250Graphics/Tools/build_local.py" \
   --source-root / \
-  --output "$HOME/Desktop/HP250-NootedGreen-SystemStack-25G332.pkg"
+  --output "$HOME/Desktop/HP250-NootedGreen-SystemStack-25G332.pkg" \
+  --sign-identity "Developer ID Installer: Tarek Wasfy (9NND3237CS)"
 ```
 
-For a fresh installation on build 25G332, set `--source-root` to the mounted backup directory containing the verified `Library` and `System` trees, for example `"/Volumes/HP-Graphics-Backup"`. The builder checks each payload hash and requires a new output filename. The public tools do not download or reconstruct missing binaries. Locally generated packages are unsigned unless separately signed with an Installer identity.
+This packages the exact stack represented by the repository's SHA-256 manifest. The source root must contain all eleven component directories and files at their original absolute paths.
+
+For a fresh installation on build 25G332, set `--source-root` to the mounted backup directory containing the verified `Library` and `System` trees, for example `"/Volumes/HP-Graphics-Backup"`. The builder checks each payload hash and requires a new output filename. The public tools do not download or reconstruct missing binaries. Signing needs the matching private key in the login keychain. If signing is omitted, the builder leaves the local package unsigned. Verify a signed result before installing:
+
+```sh
+pkgutil --check-signature "$HOME/Desktop/HP250-NootedGreen-SystemStack-25G332.pkg"
+```
+
+The private package includes the repository license, component licenses and notices, plus the macOS software license copied from the source system when available. Apple system binaries are assembled locally from the owner's source installation and are not distributed in the public GitHub release.
 
 ## 3. Install, restart and verify
 

@@ -21,7 +21,7 @@ The driver implementation is in [NootedGreen](NootedGreen), with HDMI helpers in
 
 ## Install the macOS graphics components
 
-Use the signed **HP250-Graphics-Installer-Tools-v32.pkg** and the Kext ZIP from [the v32 release](https://github.com/tarekwasfy01/NootedGreen-for-Intel-Iris-Xe-on-Raptor-Lake-U-8086-A7A1-/releases/tag/hp-a7a1-v32). The public PKG installs the packager, manifest and licenses. A working Python 3.9+ and a verified source copy of the system graphics components are required to assemble the full installer. See [installation and rollback](installer/README.md) for commands, including how to use a separate mounted source volume on a fresh installation.
+Download **HP250-Graphics-Installer-Tools-v32.pkg** and the matching kext ZIP from [the v32 release](https://github.com/tarekwasfy01/NootedGreen-for-Intel-Iris-Xe-on-Raptor-Lake-U-8086-A7A1-/releases/tag/hp-a7a1-v32). Verify the Developer ID Installer signature and checksum before installing the tools. The public PKG installs the packager, manifest and licenses. A working Python 3.9+ and a verified source copy of the system graphics components are required to assemble the full installer. See [installation and rollback](installer/README.md) for commands, including signing the locally built package and how to use a separate mounted source volume on a fresh installation.
 
 ## Build and test
 

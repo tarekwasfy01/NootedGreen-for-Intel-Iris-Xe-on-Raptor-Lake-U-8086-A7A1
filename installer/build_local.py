@@ -7,6 +7,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--source-root',type=Path,default=Path('/'))
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--sign-identity',help='Developer ID Installer identity used to sign the generated package')
     args=parser.parse_args();root=Path(__file__).resolve().parent
     assert subprocess.check_output(['/usr/bin/sw_vers','-buildVersion'],text=True).strip()=='25G332'
     spec=importlib.util.spec_from_file_location('stack',root/'stack_runtime.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
@@ -25,8 +26,14 @@ def main():
         shutil.copyfile(root/'preinstall',scripts/'preinstall');shutil.copyfile(root/'postinstall',scripts/'postinstall')
         for n in ['preinstall','postinstall']:(scripts/n).chmod(0o755)
         args.output.parent.mkdir(parents=True,exist_ok=True)
-        subprocess.run(['/usr/bin/pkgbuild','--nopayload','--scripts',str(scripts),'--identifier','local.hp250.nootedgreen.systemstack','--version','2026.11.14','--install-location','/',str(args.output.resolve())],check=True)
+        package=args.output.resolve()
+        if args.sign_identity:
+            package=work/'HP250-NootedGreen-SystemStack-unsigned.pkg'
+        subprocess.run(['/usr/bin/pkgbuild','--nopayload','--scripts',str(scripts),'--identifier','local.hp250.nootedgreen.systemstack','--version','2026.11.14','--install-location','/',str(package)],check=True)
+        if args.sign_identity:
+            subprocess.run(['/usr/bin/productsign','--sign',args.sign_identity,str(package),str(args.output.resolve())],check=True)
     print('Private full graphics package:',args.output.resolve())
-    print('Not Developer ID signed. Requires Python 3, current compatible NootedGreen EFI and build 25G332. No EFI is installed.')
+    print(('Signed with '+args.sign_identity+'.') if args.sign_identity else 'Not Developer ID signed.')
+    print('Requires Python 3, current compatible NootedGreen EFI and build 25G332. No EFI is installed.')
 
 if __name__=='__main__':main()
